@@ -1,0 +1,99 @@
+Le Feu est Chaud .
+La Glace est Froide .
+Le Soleil est Chaud .
+La Nuit est Froide .
+Le Feu brule le Bois .
+Le Feu brule le Papier .
+Eau eteint Feu .
+La Pluie est Eau .
+Le Vent pousse le Nuage .
+Le Nuage donne la Pluie .
+Le Soleil donne la Lumiere .
+La Nuit est Sombre .
+Le Jour est Clair .
+La Pierre est Solide .
+Le Bois est Solide .
+Eau est Liquide .
+Le Lait est Liquide .
+La Vapeur est Gaz .
+Le Chat est un Animal .
+Le Chien est un Animal .
+La Souris est un Animal .
+Le Lion est un Animal .
+Le Chat mange la Souris .
+Le Lion mange le Chien .
+Le Chien chasse le Chat .
+La Souris a Peur .
+Le Lion a Faim .
+Le Chat a Faim .
+Manger stop Faim .
+Dormir stop Fatigue .
+Courir donne Fatigue .
+Le Pain est Nourriture .
+La Pomme est Nourriture .
+Le Chocolat est Nourriture .
+Le Chocolat est Bon .
+Le Poison est Mauvais .
+La Douleur est Mauvais .
+La Joie est Bon .
+La Tristesse est Mauvais .
+Aimer est Bon .
+Detester est Mauvais .
+Le Couteau est Dangereux .
+Le Feu est Dangereux .
+La Maison est Abri .
+La Grotte est Abri .
+Le Lit est Confort .
+La Pierre est Dur .
+La Plume est Doux .
+Le Ciel est Haut .
+Le Sol est Bas .
+Tomber est Descendre .
+Monter est Grimper .
+Grand est le Lion .
+Petit est la Souris .
+Vite est le Guepard .
+Lent est la Tortue .
+Rouge est une Couleur .
+Bleu est une Couleur .
+Vert est une Couleur .
+Le Sang est Rouge .
+Le Ciel est Bleu .
+Herbe est Vert .
+Le Citron est Jaune .
+La Banane est Jaune .
+Le Sucre est Doux .
+Le Sel est Sale .
+Le Citron est Acide .
+Le Cafe est Amer .
+La Mere est Parent .
+Le Pere est Parent .
+Le Fils est Enfant .
+La Fille est Enfant .
+La Mere aime le Fils .
+Le Pere protege la Fille .
+Avoir est Posseder .
+Donner est Offrir .
+Prendre est Voler .
+Etre est Exister .
+Mourir est Finir .
+Naitre est Commencer .
+Le Temps passe .
+Hier est Passe .
+Demain est Futur .
+Aujourdhui est Present .
+Le Travail donne Argent .
+Argent achete Nourriture .
+Le Medecin soigne Maladie .
+La Maladie est Mauvais .
+La Sante est Bon .
+Le Livre donne Savoir .
+Lire est Apprendre .
+Ignorer est Stupide .
+Savoir est Intelligent .
+Le Roi dirige le Royaume .
+Le Soldat protege le Roi .
+La Guerre est Violence .
+La Paix est Calme .
+La Fleur est Belle .
+La Poubelle est Sale .
