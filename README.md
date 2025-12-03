@@ -8,6 +8,10 @@
 <p align="center">
 <img width="100%" alt="Gemini_Generated_Image_dvm8hsdvm8hsdvm8" src="https://github.com/user-attachments/assets/70134f46-6a17-431e-8393-c9606fc631ff" />
 </p>
+<p align="center">
+![Gemini_Generated_Image_dvm8hsdvm8hsdvm8 - Copie](https://github.com/user-attachments/assets/ca98ec28-0836-4c50-96c7-e2d39559dbb4)
+</p>
+
 
 **GeneISys** is an experimental AI engine developed through a "Vibe Coding" session with Gemini 3 Pro. It explores a radical alternative to Transformers: a **White Box**, **Continuously Learning** architecture where concepts interact as physical bodies in a semantic vector space.
 
