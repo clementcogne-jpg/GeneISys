@@ -65,7 +65,7 @@ graph TD
 ## ⚙️ Installation
 
 ### Prerequisites
-* **Python 3.12+** (Tested on 3.12.10)
+* **Python 3.12+** (Tested on 3.12.10)  [Donwload Python](https://www.python.org/downloads/)
 * **CUDA 12.x** (Optional, for GPU acceleration. Tested on CUDA 12.8)
 
 ### Dependencies
@@ -80,6 +80,25 @@ For the engine to boot correctly, ensure these files are present in the **root d
 * `genesis_curriculum_test.txt` (Critical for initial unit tests)
 * `genesis_curriculum.txt` (For mass training mode)
 * `fake_vectors.txt` (Optional, for import tests)
+
+### Launch on windows
+```bash
+:: If Python is in your PATH:
+python geneisys.py
+
+:: If you downloaded the embedded package or have no PATH:
+:: (Replace [path-to-python] with your actual folder, e.g., C:\Python312\)
+[path-to-python]\python.exe geneisys.py
+```
+
+### Launch on Linux and MacOS
+```bash
+# If Python is in your PATH (Standard):
+python3 geneisys.py
+
+# If you need the absolute path (No Env Variables):
+/usr/bin/python3 geneisys.py
+```
 
 ---
 
