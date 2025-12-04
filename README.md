@@ -157,3 +157,19 @@ This architecture is designed to be highly elastic, but physics simulations are 
 
 *This is a personal hobby project shared for educational purposes to demonstrate the potential of Neuro-Symbolic AI. It is provided "as-is" without warranty.*
 
+---
+## 📚 Citation
+
+If you use GeneISys in your research, please cite it using the following BibTeX entry:
+
+```bibtex
+@software{cogne2025geneisys,
+  author = {Cogné, Clément},
+  title = {GeneISys: An Organic Neuro-Symbolic Engine based on Semantic Physics},
+  year = {2025},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{[https://github.com/clementcogne/GeneISys](https://github.com/clementcogne/GeneISys)}},
+  commit = {main}
+}
+
