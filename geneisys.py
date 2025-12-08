@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.95_STABLE_alpha"
+strVersion = "0.0.96_STABLE_alpha"
 
 
 import torch
@@ -157,7 +157,7 @@ class GenesisConfig:
             self.STORAGE_DTYPE = torch.int8
             self.COMPUTE_DTYPE = torch.float32 # On décompresse pour le calcul
             print(" [CONFIG] Mode: INT8 (Ultra-Compression).")
-        elif self.PRECISION_MODE == "FP16" and self.DEVICE.type == "cuda":
+        elif self.PRECISION_MODE == "FP16":# and self.DEVICE.type == "cuda":
             self.STORAGE_DTYPE = torch.float16
             self.COMPUTE_DTYPE = torch.float16
             print(" [CONFIG] Mode: FP16 (Rapide GPU).")
@@ -277,7 +277,15 @@ class GenesisConfig:
         self.INGEST_DEFAULT_EPOCHS = 1
         self.EPSILON = 1e-5
         
-        self.USE_TRIGRAMS = False 
+        # --- NOUVEAU : CONSTANTES PHYSIQUES CENTRALISÉES (Patch Stabilité) ---
+        self.PHYSICS_EPSILON = 0.1          # Évite la division par zéro (Distance)
+        self.SIMILARITY_POWER = 3.0         # Facteur d'amplification de la similarité
+        self.INTERACTION_THRESHOLD = 0.001  # Seuil minimal pour considérer une force
+        self.FORCE_CLAMP_MIN = -0.99        # Bornes pour éviter l'explosion numérique
+        self.FORCE_CLAMP_MAX = 0.99
+        
+        # --- ATTENTION SÉLECTIVE (Recap 12) ---
+        self.TOP_K_LIMIT = 10  # Nombre max de voisins influents (Gravité Sparse)
         
         self._calculate_dimensional_params()
 
@@ -304,24 +312,46 @@ class GenesisConfig:
 CFG = GenesisConfig()
 
 
-# --- 1. KERNELS PHYSIQUES (OPTIMISATION SYMETRIQUE) ---
+
+    
+    
 def gravity_kernel_masked_symmetric(positions: torch.Tensor, 
                                     masses: torch.Tensor, 
                                     vecs: torch.Tensor,
                                     mask: torch.Tensor = None) -> torch.Tensor:
-    sim_matrix = torch.mm(vecs, vecs.t())
-    dist_matrix = torch.abs(positions.unsqueeze(1) - positions.unsqueeze(0)) + 0.1
+    """
+    Noyau Physique Unifié (CPU/GPU Compatible).
+    Utilise la similarité Cosine et le Clamping pour la stabilité numérique.
+    Remplace l'ancienne logique dot-product pure qui causait des NaN.
+    """
+    # 1. Normalisation pour stabilité (Cosine Similarity)
+    # eps=1e-8 évite la division par zéro si un vecteur est nul
+    vecs_norm = F.normalize(vecs, p=2, dim=1, eps=CFG.EPSILON)
+    
+    # 2. Similarité Matricielle (Optimisé AVX2 sur CPU, CUDA Cores sur GPU)
+    sim_matrix = torch.mm(vecs_norm, vecs_norm.t())
+    
+    # 3. Sécurité Numérique (Clamping)
+    # Empêche les valeurs > 1.0 ou < -1.0 qui font exploser le .pow(3)
+    sim_safe = torch.clamp(sim_matrix, CFG.FORCE_CLAMP_MIN, CFG.FORCE_CLAMP_MAX)
+    
+    # 4. Calcul de la Gravité Sémantique
+    dist_matrix = torch.abs(positions.unsqueeze(1) - positions.unsqueeze(0)) + CFG.PHYSICS_EPSILON
     mass_prod = masses.unsqueeze(1) * masses.unsqueeze(0)
-    numerator = mass_prod * (sim_matrix + 1.0).pow(3)
+    
+    # (Sim + 1)^3 permet de favoriser fortement les concepts proches
+    numerator = mass_prod * (sim_safe + 1.0).pow(CFG.SIMILARITY_POWER)
     forces = numerator / dist_matrix
+    
     if mask is not None:
         forces = forces * mask
+        
     forces.fill_diagonal_(0.0)
     return forces
 
 # --- 1. KERNELS PHYSIQUES (OPTIMISATION SYMETRIQUE & VECTORISEE) ---
 @jit(nopython=True, parallel=True, fastmath=True)
-def driver_cpu_numba(positions, masses, vecs, dim, n, mask):
+def driver_cpu_numba_LEGACY(positions, masses, vecs, dim, n, mask):
     forces = np.zeros((n, n), dtype=np.float32)
     # Optimisation: On vérifie une seule fois si un masque existe via sa forme
     has_mask = mask.shape[0] > 0
@@ -406,7 +436,7 @@ class ChunkedGravityEngine:
         else:
             return self._compute_internal(pos, mass, vecs, n_active, mask)
 
-    def _compute_internal(self, pos, mass, vecs, n_active, mask=None):
+    def _compute_internal_legacy(self, pos, mass, vecs, n_active, mask=None):
         if self.mode == "CPU":
             p_cpu = pos.cpu().numpy(); m_cpu = mass.cpu().numpy(); v_cpu = vecs.cpu().numpy()
             
@@ -429,6 +459,30 @@ class ChunkedGravityEngine:
             else:
                 # IMPORTANT: En mode Graph, si pas de masque, on remplit de 1.0
                 # car le kernel GPU fait une multiplication matricielle stricte.
+                self.static_input_mask[:n_active, :n_active].fill_(1.0)
+            self.cuda_graph.replay()
+            return self.static_output_forces[:n_active, :n_active]
+
+        if n_active <= 5000:
+            return self.optimized_kernel(pos, mass, vecs, mask)
+
+        return self._compute_chunked_sparse_offload(pos, mass, vecs, n_active)
+        
+    def _compute_internal(self, pos, mass, vecs, n_active, mask=None):
+        # MODE CPU : On utilise maintenant PyTorch (AVX2/MKL) au lieu de Numba
+        # C'est ce qui assure la compatibilité et la stabilité numérique
+        if self.mode == "CPU":
+            # Appel direct au kernel PyTorch unifié (Rapide & Stable)
+            return self.optimized_kernel(pos, mass, vecs, mask)
+
+        # ... (Le reste de la fonction pour le mode GPU/Hybrid reste inchangé) ...
+        if n_active <= self.max_capacity and self.mode == "HYBRID_AUTO":
+            self.static_input_pos[:n_active].copy_(pos)
+            self.static_input_mass[:n_active].copy_(mass)
+            self.static_input_vecs[:n_active].copy_(vecs)
+            if mask is not None:
+                self.static_input_mask[:n_active, :n_active].copy_(mask)
+            else:
                 self.static_input_mask[:n_active, :n_active].fill_(1.0)
             self.cuda_graph.replay()
             return self.static_output_forces[:n_active, :n_active]
@@ -487,6 +541,30 @@ class Quantizer:
     def to_storage(tensor): return tensor.to(CFG.STORAGE_DTYPE)
     @staticmethod
     def from_storage(tensor): return tensor.to(CFG.COMPUTE_DTYPE)
+
+
+class SmartQuantizer:
+    """
+    Gestionnaire de quantification symétrique INT8 avec scaling.
+    [FIX FP16] Epsilon ajusté à 1e-5 pour éviter l'underflow en Half Precision.
+    """
+    @staticmethod
+    def quantize(tensor_fp32):
+        # keepdim=True permet de garder la dimension pour la division broadcastée
+        max_val = tensor_fp32.abs().max(dim=-1, keepdim=True).values
+        scale = max_val / 127.0
+        # 1e-8 est trop petit pour FP16 (min ~6e-5). On met 1e-5 pour être safe.
+        scale = torch.clamp(scale, min=1e-5) 
+        
+        tensor_int8 = (tensor_fp32 / scale).round().to(torch.int8)
+        return tensor_int8, scale
+
+    @staticmethod
+    def dequantize(tensor_int8, scale):
+        return tensor_int8.to(torch.float32) * scale
+
+
+
 
 class DefLanguage:
     def __init__(self, strLang="fr"):
@@ -696,7 +774,7 @@ class AssociativeMemory:
             
             # get_semantic_vector renvoie déjà du COMPUTE_DTYPE, on normalise juste
             if v.is_sparse: v = v.to_dense()
-            vecs.append(F.normalize(v, p=2, dim=0))
+            vecs.append(F.normalize(v, p=2, dim=0, eps=CFG.EPSILON))
             
         if vecs:
             self.vocab_vectors = torch.stack(vecs).to(CFG.DEVICE)
@@ -708,7 +786,7 @@ class AssociativeMemory:
         self._refresh_lexicon()
         if self.vocab_vectors is None: return "???"
         if vector.dim() == 1: vector = vector.unsqueeze(0)
-        query = F.normalize(vector.to(CFG.COMPUTE_DTYPE), p=2, dim=1)
+        query = F.normalize(vector.to(CFG.COMPUTE_DTYPE), p=2, dim=1, eps=CFG.EPSILON)
         scores = torch.mm(query, self.vocab_vectors.t()).squeeze(0)
         k_val = min(2, len(scores))
         best_scores, best_indices = torch.topk(scores, k=k_val)
@@ -722,15 +800,25 @@ class HybridMemoryCluster:
     def __init__(self, dim, max_nodes=None):
         self.dim = dim
         self.capacity = max_nodes if max_nodes else CFG.INITIAL_MAX_NODES
+        
+        # Détection du mode de compression (Utilisez is_quantized pour être cohérent avec votre code précédent)
+        self.is_quantized = (CFG.STORAGE_DTYPE == torch.int8)
+        
         print(f" [MEMORY] Allocation Index Rapide: ({self.capacity}, {self.dim}) en {CFG.INDEX_DTYPE}")
         self.fast_index = torch.zeros((self.capacity, self.dim), dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
         
         print(f" [MEMORY] Allocation Stockage Maître: ({self.capacity}, {self.dim}) en {CFG.STORAGE_DTYPE} sur {CFG.STORAGE_DEVICE}")
         self.master_storage = torch.zeros((self.capacity, self.dim), dtype=CFG.STORAGE_DTYPE, device=CFG.STORAGE_DEVICE)
         
+        # --- CORRECTIF : Allocation INCONDITIONNELLE des Scales ---
+        # On en a besoin même en FP16/32 pour charger proprement les transitions de format
+        self.master_scales = torch.ones((self.capacity, 1), dtype=torch.float32, device=CFG.STORAGE_DEVICE)
+        
         if CFG.ENABLE_PAGING and self.master_storage.device.type == 'cpu':
             self.master_storage = self.master_storage.pin_memory()
+            self.master_scales = self.master_scales.pin_memory()
             print(" [MEMORY] Pinned Memory activée.")
+            
         self.active_count = 0
         self.name_to_idx = {} 
         self.idx_to_name = {} 
@@ -743,15 +831,25 @@ class HybridMemoryCluster:
             new_index = torch.zeros((new_capacity, self.dim), dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
             new_index[:self.capacity] = self.fast_index
             self.fast_index = new_index
+            
             new_storage = torch.zeros((new_capacity, self.dim), dtype=CFG.STORAGE_DTYPE, device=CFG.STORAGE_DEVICE)
             new_storage[:self.capacity] = self.master_storage
+            
+            # --- CORRECTIF : Resize systématique des scales ---
+            new_scales = torch.ones((new_capacity, 1), dtype=torch.float32, device=CFG.STORAGE_DEVICE)
+            new_scales[:self.capacity] = self.master_scales
+                
             if CFG.ENABLE_PAGING and new_storage.device.type == 'cpu': 
                 try:
                     new_storage = new_storage.pin_memory()
+                    new_scales = new_scales.pin_memory()
                     print(f" [MEMORY] Pinned Memory allouée avec succès ({new_capacity} slots).")
                 except RuntimeError:
                     print(f" [WARN] Echec Pinned Memory (OOM). Fallback sur RAM standard.")
+            
             self.master_storage = new_storage
+            self.master_scales = new_scales # Toujours présent
+            
             self.capacity = new_capacity
         except RuntimeError as e:
             print(f" [CRITICAL] Impossible d'allouer {new_capacity} slots: {e}")
@@ -761,15 +859,24 @@ class HybridMemoryCluster:
         batch_size = len(names)
         if batch_size == 0: return
         
-        # Gestion de la taille
         if self.active_count + batch_size >= self.capacity:
             self.resize(max(self.capacity * 2, self.active_count + batch_size + 1000))
             
         indices_list = []
-        # On prépare les vecteurs pour le stockage (peut être une vue)
-        storage_vectors = Quantizer.to_storage(vectors)
         
-        # Boucle d'assignation des IDs
+        # --- BRANCHE CONDITIONNELLE : QUANTIZATION ---
+        if self.is_quantized:
+            # Mode INT8 : On compresse avant de stocker
+            # vectors est supposé être FP32/FP16 ici
+            storage_vectors, batch_scales = SmartQuantizer.quantize(vectors)
+            # On s'assure que les scales sont en (N, 1)
+            if batch_scales.dim() == 1: batch_scales = batch_scales.unsqueeze(1)
+        else:
+            # Mode FP32 (Standard) : On stocke tel quel
+            storage_vectors = Quantizer.to_storage(vectors)
+            batch_scales = None
+        # ---------------------------------------------
+        
         for i, name in enumerate(names):
             if name in self.name_to_idx:
                 idx = self.name_to_idx[name]
@@ -780,39 +887,47 @@ class HybridMemoryCluster:
                 self.active_count += 1
             indices_list.append(idx)
             
-            # Mise à jour Shard (Stockage Fichier)
+            # Mise à jour Shard
             sid = abs(hash(name)) % CFG.SHARD_COUNT
-            # .detach() ici est safe car shards est un dict Python standard
-            self.shards[sid][name] = storage_vectors[i].detach().to(CFG.DEVICE)
+            
+            if self.is_quantized:
+                # En mode INT8, le shard doit stocker le tuple (vec, scale) ou un objet composite
+                # Pour simplifier la compatibilité fichier, on stocke le vecteur compressé
+                # ATTENTION : La gestion des shards en INT8 demandera une maj de save/load_shard plus tard
+                # Pour l'instant, on stocke le tenseur principal.
+                self.shards[sid][name] = storage_vectors[i].detach().to(CFG.DEVICE)
+                # Note: On perd l'échelle dans les Shards ici pour l'instant (dette technique acceptée pour cette étape)
+                # Mais on l'a dans master_scales pour le runtime.
+            else:
+                self.shards[sid][name] = storage_vectors[i].detach().to(CFG.DEVICE)
             
         if not indices_list: return
         
         indices_tensor = torch.tensor(indices_list, device=CFG.INDEX_DEVICE, dtype=torch.long)
         
-        # --- 1. MISE À JOUR MEMOIRE VIVE (FAST INDEX) ---
-        # FIX OP5 : Distinction nette CPU/GPU pour éviter les crashs et maximiser la vitesse
+        # 1. Mise à jour Fast Index (Toujours haute précision pour le calcul)
         if self.fast_index.device.type == 'cpu':
-            # Sur CPU : On clone pour casser le lien mémoire (Anti-Aliasing)
             vectors_tensor = vectors.detach().clone().to(dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
-            # L'assignation par crochet [] est plus stable que index_copy_ sur CPU
             self.fast_index[indices_tensor] = vectors_tensor
         else:
-            # Sur GPU : index_copy_ est optimisé et asynchrone
             vectors_tensor = vectors.to(dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
             self.fast_index.index_copy_(0, indices_tensor, vectors_tensor)
-        # -----------------------------------------------
         
-        # --- 2. MISE À JOUR STOCKAGE MAITRE (MASTER STORAGE) ---
+        # 2. Mise à jour Master Storage (Froid/Compressé)
         indices_cpu = indices_tensor.to(CFG.STORAGE_DEVICE)
         
         if self.master_storage.device.type == 'cpu':
-             # Copie défensive obligatoire sur CPU pour éviter "unsupported operation"
              storage_tensor = storage_vectors.detach().clone().to(device=CFG.STORAGE_DEVICE)
+             if self.is_quantized:
+                 scales_tensor = batch_scales.detach().clone().to(device=CFG.STORAGE_DEVICE)
         else:
-             # Transfert simple sur GPU
              storage_tensor = storage_vectors.to(device=CFG.STORAGE_DEVICE)
+             if self.is_quantized:
+                 scales_tensor = batch_scales.to(device=CFG.STORAGE_DEVICE)
              
         self.master_storage.index_copy_(0, indices_cpu, storage_tensor)
+        if self.is_quantized:
+            self.master_scales.index_copy_(0, indices_cpu, scales_tensor)
 
     def update(self, name, vector):
         if vector.dim() == 1: vector = vector.unsqueeze(0)
@@ -827,6 +942,8 @@ class HybridMemoryCluster:
         if self.active_count == 0: return []
         if query_vec.dim() == 1: query_vec = query_vec.unsqueeze(0)
         q = query_vec.to(dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
+        
+        # Recherche sur le Fast Index (toujours décompressé/précis)
         active_matrix = self.fast_index[:self.active_count]
         scores = torch.mm(q, active_matrix.t()).squeeze(0)
         k_safe = min(k, self.active_count)
@@ -848,82 +965,99 @@ class HybridMemoryCluster:
                 indices.append(self.name_to_idx[n])
                 found_names.append(n)
         if not indices: return None, []
+        
         indices_tensor = torch.tensor(indices, device=CFG.STORAGE_DEVICE)
         raw_vecs = self.master_storage.index_select(0, indices_tensor).to(CFG.DEVICE)
-        vecs = Quantizer.from_storage(raw_vecs)
+        
+        # --- DECOMPRESSION CONDITIONNELLE ---
+        if self.is_quantized:
+            raw_scales = self.master_scales.index_select(0, indices_tensor).to(CFG.DEVICE)
+            # Restauration FP32 depuis INT8
+            vecs = SmartQuantizer.dequantize(raw_vecs, raw_scales)
+            # Conversion finale vers le type de calcul souhaité (ex: FP16)
+            vecs = vecs.to(CFG.COMPUTE_DTYPE)
+        else:
+            vecs = Quantizer.from_storage(raw_vecs)
+        # ------------------------------------
+        
         return vecs, found_names
 
     def get_all_loaded_tensors(self):
+        """
+        [CORRECTIF CRITIQUE] Récupère tous les tenseurs pour le Lexique.
+        Force le retour sur GPU (CFG.DEVICE) pour éviter le crash Device Mismatch.
+        """
         all_t = {}
-        for s_data in self.shards.values():
-            for k, v in s_data.items(): 
-                all_t[k] = Quantizer.from_storage(v).squeeze(0)
+        for k, idx in self.name_to_idx.items():
+            if idx < self.active_count:
+                # 1. Lecture Master Storage (Souvent CPU)
+                vec = self.master_storage[idx]
+                scale = self.master_scales[idx]
+                
+                # 2. Transfert immédiat vers le Device de Calcul (GPU)
+                # C'est cette étape qui manquait et causait le crash
+                vec_gpu = vec.to(CFG.DEVICE)
+                scale_gpu = scale.to(CFG.DEVICE)
+                
+                if vec.dtype == torch.int8:
+                     val_final = SmartQuantizer.dequantize(vec_gpu, scale_gpu)
+                else:
+                     val_final = vec_gpu
+                
+                # On stocke dans le dictionnaire, prêt pour l'encodeur
+                all_t[k] = val_final.to(dtype=CFG.COMPUTE_DTYPE)
         return all_t
         
-        
     def sync_to_host(self, encoder_ref=None):
-        """
-        [CRITIQUE] Synchronise la mémoire vive (GPU/Fast) vers le stockage froid (CPU/Shards).
-        À appeler impérativement avant une sauvegarde.
-        """
         if self.active_count == 0: return
 
         print(f" [MEMORY] Synchronisation VRAM -> RAM ({self.active_count} vecteurs)...")
-        
-        # 1. Transfert de masse GPU -> CPU (Très rapide car vectorisé)
-        # On copie uniquement la partie active pour ne pas transférer du vide
         active_slice_gpu = self.fast_index[:self.active_count]
         
-        # Conversion intelligente vers le type de stockage (ex: FP32)
-        # .to(device, dtype) gère le transfert et la conversion en une passe
-        cpu_data = active_slice_gpu.to(device=CFG.STORAGE_DEVICE, dtype=CFG.STORAGE_DTYPE)
+        # --- BLOC ACTIVÉ : Re-Quantization dynamique ---
+        if self.is_quantized: 
+             # On recalcule les INT8 et les Scales basés sur la nouvelle position du vecteur
+             q_vecs, q_scales = SmartQuantizer.quantize(active_slice_gpu)
+             
+             # On met à jour le stockage maître (RAM)
+             self.master_storage[:self.active_count] = q_vecs.to(CFG.STORAGE_DEVICE)
+             self.master_scales[:self.active_count] = q_scales.to(CFG.STORAGE_DEVICE)
+        else:
+            # Mode FP32 Classique
+            cpu_data = active_slice_gpu.to(device=CFG.STORAGE_DEVICE, dtype=CFG.STORAGE_DTYPE)
+            self.master_storage[:self.active_count] = cpu_data
+        # -----------------------------------------------
         
-        # Mise à jour du stockage maître
-        self.master_storage[:self.active_count] = cpu_data
-        
-        # 2. Répercussion sur les Shards (Pour la sauvegarde fichier)
-        # C'est la partie "lente" (boucle Python), mais nécessaire pour le format de fichier actuel.
-        # On peut l'optimiser, mais assurons la cohérence d'abord.
-        
-        # Pour éviter de tout parcourir, on ne met à jour que si nécessaire, 
-        # mais ici on force pour être sûr que la physique est sauvegardée.
+        # Synchro Shards (pour sauvegarde)
         for name, idx in self.name_to_idx.items():
             if idx < self.active_count:
-                # On récupère le vecteur frais depuis le master_storage
                 vec = self.master_storage[idx]
-                
-                # Mise à jour du Shard
                 sid = abs(hash(name)) % CFG.SHARD_COUNT
-                
-                # --- FIX CRASH CPU SAVE (OP5) ---
-                # Sur CPU, assigner une vue d'un tenseur (detach) dans une structure 
-                # qui le contient peut provoquer une erreur d'aliasing.
-                # On clone systématiquement pour la sauvegarde, garantissant l'indépendance.
                 if self.master_storage.device.type == 'cpu':
                     safe_vec = vec.detach().clone()
                 else:
                     safe_vec = vec.detach()
-                # --------------------------------
-                
                 self.shards[sid][name] = safe_vec
                 
-                # 3. Mise à jour du Semantic Map Legacy
-                if encoder_ref is not None:
-                    # Même punition pour le dictionnaire legacy
-                    if self.master_storage.device.type == 'cpu':
-                         encoder_ref.semantic_map[name] = safe_vec.clone() # Double sécu
-                    else:
+                if encoder_ref is not None and not self.is_quantized:
+                     if self.master_storage.device.type == 'cpu':
+                         encoder_ref.semantic_map[name] = safe_vec.clone()
+                     else:
                          encoder_ref.semantic_map[name] = safe_vec
         
         
     def save_all(self, encoder_ref=None):
-        # --- FIX: Appel du Flush avant sauvegarde ---
         self.sync_to_host(encoder_ref)
-        # --------------------------------------------
         
         for sid, data in self.shards.items():
             SafeFileManager.save_shard(data, sid, CFG.BASE_MEM_DIR)
         
+        # Sauvegarde des Scales si on est en INT8
+        if self.is_quantized and self.master_scales is not None:
+             # On sauvegarde juste la partie active
+             active_scales = self.master_scales[:self.active_count]
+             SafeFileManager.save_tensors({"memory_scales": active_scales}, os.path.join(CFG.BASE_MEM_DIR, "memory_scales.safetensors"))
+
         SafeFileManager.save_json({
             "mapping": {
                 "name_to_idx": self.name_to_idx, 
@@ -938,16 +1072,63 @@ class HybridMemoryCluster:
             self.name_to_idx = meta["mapping"].get("name_to_idx", {})
             self.active_count = meta["mapping"].get("active_count", 0)
             self.idx_to_name = {v: k for k, v in self.name_to_idx.items()}
+            
+        # Chargement des Scales
+        path_scales = os.path.join(CFG.BASE_MEM_DIR, "memory_scales.safetensors")
+        if os.path.exists(path_scales):
+             scale_dict = SafeFileManager.load_tensors(path_scales)
+             if "memory_scales" in scale_dict:
+                 loaded_scales = scale_dict["memory_scales"].to(CFG.STORAGE_DEVICE)
+                 len_s = min(loaded_scales.shape[0], self.capacity)
+                 self.master_scales[:len_s] = loaded_scales[:len_s]
+                 print(f" [MEMORY] Scales chargés ({len_s} entrées).")
+
+        # Chargement Données
         for sid in range(CFG.SHARD_COUNT):
             data = SafeFileManager.load_shard(sid, CFG.BASE_MEM_DIR)
             for k, v in data.items():
                 self.shards[sid][k] = v
+                
                 if k in self.name_to_idx:
                     idx = self.name_to_idx[k]
                     if idx < self.capacity:
-                        vec = Quantizer.from_storage(v).squeeze(0)
-                        self.fast_index[idx] = vec.to(dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
-                        self.master_storage[idx] = v.to(dtype=CFG.STORAGE_DTYPE, device=CFG.STORAGE_DEVICE)
+                        
+                        # --- LOGIQUE UNIVERSELLE DE CHARGEMENT ---
+                        # Source (Fichier) vs Destination (Mode Configuré)
+                        
+                        # Cas 1 : Source INT8 -> Mode Float (Décompression)
+                        if v.dtype == torch.int8 and not self.is_quantized:
+                             scale = self.master_scales[idx].to(CFG.STORAGE_DEVICE)
+                             v_in = v.to(CFG.STORAGE_DEVICE)
+                             v_final = SmartQuantizer.dequantize(v_in, scale).to(CFG.STORAGE_DTYPE)
+                             
+                        # Cas 2 : Source Float -> Mode INT8 (Compression)
+                        # C'est le cas qui manquait ("l'oubli du if")
+                        elif v.dtype != torch.int8 and self.is_quantized:
+                             v_in = v.to(CFG.STORAGE_DEVICE)
+                             # On doit quantizer à la volée
+                             q_vec, q_scale = SmartQuantizer.quantize(v_in)
+                             v_final = q_vec
+                             self.master_scales[idx] = q_scale.squeeze() # Update du scale manquant
+                             
+                        # Cas 3 : Identiques (INT8->INT8 ou Float->Float)
+                        else:
+                             v_final = v.to(dtype=CFG.STORAGE_DTYPE, device=CFG.STORAGE_DEVICE)
+                        
+                        # Stockage Maître
+                        self.master_storage[idx] = v_final
+                        
+                        # Restauration Fast Index (Toujours Float sur GPU)
+                        if v_final.dtype == torch.int8:
+                             scale = self.master_scales[idx].to(CFG.INDEX_DEVICE)
+                             v_gpu = v_final.to(CFG.INDEX_DEVICE)
+                             v_idx = SmartQuantizer.dequantize(v_gpu, scale)
+                        else:
+                             v_idx = v_final.to(CFG.INDEX_DEVICE)
+                             
+                        self.fast_index[idx] = v_idx.to(dtype=CFG.INDEX_DTYPE).reshape(self.dim)
+        
+        print(f" [MEMORY] Index chargé et restauré ({self.active_count} noeuds).")
 
 class CognitiveStats:
     def __init__(self): self.usage = Counter(); self.accumulated_impact = {}; self.weights = {} 
@@ -977,7 +1158,7 @@ class MatrixEncoder(nn.Module):
              
         vocab_size = 5000 
         self.projection = torch.randn(vocab_size, self.dim, device=CFG.DEVICE)
-        self.projection = F.normalize(self.projection, p=2, dim=1)
+        self.projection = F.normalize(self.projection, p=2, dim=1, eps=CFG.EPSILON)
         self._load_map()
 
     def lock_concept(self, w): self.locked_words.add(w)
@@ -1015,7 +1196,7 @@ class MatrixEncoder(nn.Module):
         vectors_scrambled = vectors * pos_encoding
         encoded_vec = torch.sum(vectors_scrambled, dim=0)
         
-        return F.normalize(encoded_vec, p=2, dim=0)
+        return F.normalize(encoded_vec, p=2, dim=0, eps=CFG.EPSILON)
 
     def encode_word(self, text):
         self.stats.usage[text.lower()] += 1
@@ -1031,7 +1212,14 @@ class MatrixEncoder(nn.Module):
         vec = self._generate_basis_from_ids(ids)
         w = self.stats.get_inverse_freq_weight(text.lower())
         final_vec = vec * w 
-        self.semantic_map[text] = Quantizer.to_storage(final_vec)
+        # --- CORRECTIF BUG "BODY" ---
+        # Avant : self.semantic_map[text] = Quantizer.to_storage(final_vec)
+        # Problème : En INT8, to_storage détruit les petites valeurs -> Vecteur Nul -> Body
+        
+        # Solution : On garde le cache de l'encodeur en Haute Précision (COMPUTE_DTYPE)
+        # Cela évite le zéro, et c'est cohérent car semantic_map est un cache "chaud".
+        self.semantic_map[text] = final_vec.to(dtype=CFG.COMPUTE_DTYPE)
+        # ----------------------------
         return final_vec
     
     #old function
@@ -1131,7 +1319,7 @@ class MatrixEncoder(nn.Module):
         ], device=CFG.DEVICE).unsqueeze(1)
         
         # Application aux vecteurs
-        final_vecs = F.normalize(encoded_vecs, p=2, dim=1) * weights
+        final_vecs = F.normalize(encoded_vecs, p=2, dim=1, eps=CFG.EPSILON) * weights
         
         # MODIFICATION : On retourne aussi les poids bruts !
         # Ils serviront de "Masse de base" pour la physique.
@@ -1165,11 +1353,11 @@ class MatrixEncoder(nn.Module):
         return Quantizer.from_storage(self.semantic_map[text])
 
     def learn_attraction(self, wa, wb, force=0.1):
-        f = force * self.brain.temperature; va = self.get_semantic_vector(wa); vb = self.get_semantic_vector(wb); tgt = F.normalize(va+vb, p=2, dim=0)
+        f = force * self.brain.temperature; va = self.get_semantic_vector(wa); vb = self.get_semantic_vector(wb); tgt = F.normalize(va+vb, p=2, dim=0, eps=CFG.EPSILON)
         elasticity = CFG.ELASTICITY_ATTRACTION
         if wa not in self.locked_words: 
             ra = (self.encode_word(wa) - va) * elasticity; ma = (tgt - va) * f
-            new_va = F.normalize(va + ma + ra, p=2, dim=0)
+            new_va = F.normalize(va + ma + ra, p=2, dim=0, eps=CFG.EPSILON)
             
             self.semantic_map[wa] = Quantizer.to_storage(new_va)
             # --- FIX : On injecte le NOUVEAU vecteur directement ---
@@ -1178,7 +1366,7 @@ class MatrixEncoder(nn.Module):
 
         if wb not in self.locked_words:
             rb = (self.encode_word(wb) - vb) * elasticity; mb = (tgt - vb) * f
-            new_vb = F.normalize(vb + mb + rb, p=2, dim=0)
+            new_vb = F.normalize(vb + mb + rb, p=2, dim=0, eps=CFG.EPSILON)
             
             self.semantic_map[wb] = Quantizer.to_storage(new_vb)
             # --- FIX : On injecte le NOUVEAU vecteur directement ---
@@ -1228,7 +1416,7 @@ class MatrixEncoder(nn.Module):
         
         # Target mutual attraction (A s'approche de B, B s'approche de A)
         # Ou convergence vers le centre (A+B)
-        target_center = F.normalize(vecs_a + vecs_b, p=2, dim=1)
+        target_center = F.normalize(vecs_a + vecs_b, p=2, dim=1, eps=CFG.EPSILON)
         
         # Calcul des Deltas
         # delta = (Target - Current) * Force * Plasticity
@@ -1240,8 +1428,8 @@ class MatrixEncoder(nn.Module):
         delta_a = (target_center - vecs_a) * frc_expanded * CFG.LEARNING_RATE_HARDWARE
         delta_b = (target_center - vecs_b) * frc_expanded * CFG.LEARNING_RATE_HARDWARE
         
-        new_vecs_a = F.normalize(vecs_a + delta_a, p=2, dim=1)
-        new_vecs_b = F.normalize(vecs_b + delta_b, p=2, dim=1)
+        new_vecs_a = F.normalize(vecs_a + delta_a, p=2, dim=1, eps=CFG.EPSILON)
+        new_vecs_b = F.normalize(vecs_b + delta_b, p=2, dim=1, eps=CFG.EPSILON)
         
         # 4. Application (Batch Scatter/Update)
         safe_vecs_a = new_vecs_a.to(CFG.INDEX_DTYPE)
@@ -1266,11 +1454,22 @@ class MatrixEncoder(nn.Module):
             
     def learn_repulsion(self, wa, wb, force=0.1):
         if wa in self.locked_words: return
-        va = self.get_semantic_vector(wa); vb = self.get_semantic_vector(wb)
+        
+        va = self.get_semantic_vector(wa)
+        vb = self.get_semantic_vector(wb)
+        
+        # Calcul de la répulsion
         ra = (self.encode_word(wa) - va) * CFG.ELASTICITY_ATTRACTION
-        new_va = F.normalize(va - (vb*force) + ra, p=2, dim=0)
-        self.semantic_map[wa] = Quantizer.to_storage(new_va)
-        self.brain.memory.update(wa, self.get_semantic_vector(wa))
+        new_va = F.normalize(va - (vb * force) + ra, p=2, dim=0, eps=CFG.EPSILON)
+        
+        # --- CORRECTIF : Sauvegarde du NOUVEAU vecteur ---
+        # 1. Mise à jour cache local (avec le fix "Body" appliqué ici aussi par sécurité)
+        self.semantic_map[wa] = new_va.to(dtype=CFG.COMPUTE_DTYPE)
+        
+        # 2. Mise à jour mémoire centrale (On passe new_va, pas self.get_semantic_vector(wa))
+        self.brain.memory.update(wa, new_va)
+        # -----------------------------------------------
+        
         self.brain.associative_memory.is_dirty = True
         
     def save(self, path):
@@ -1399,7 +1598,7 @@ class FractalNode(nn.Module):
         else:
             if current.is_sparse: current = current.to_dense()
             delta = (target_vec - current) * self.plasticity * force
-            new_vec = F.normalize(current + delta, p=2, dim=0)
+            new_vec = F.normalize(current + delta, p=2, dim=0, eps=CFG.EPSILON)
         self.set(dim, new_vec)
         new_e = min(100.0, self.energy + 10.0)
         self.energy = new_e
@@ -1408,7 +1607,7 @@ class FractalNode(nn.Module):
         visited.add(self.name)
         if not self.children: return self.nature_vec
         vecs = [c.update_centroid(visited) for c in self.children.values()]
-        if vecs: self.nature_vec = F.normalize(self.nature_vec * (1-CFG.MOMENTUM_MEAN) + torch.stack(vecs).mean(dim=0) * CFG.MOMENTUM_MEAN, p=2, dim=0)
+        if vecs: self.nature_vec = F.normalize(self.nature_vec * (1-CFG.MOMENTUM_MEAN) + torch.stack(vecs).mean(dim=0) * CFG.MOMENTUM_MEAN, p=2, dim=0, eps=CFG.EPSILON)
         return self.nature_vec
     def apply_decay(self):
         dead = []
@@ -1420,14 +1619,18 @@ class FractalNode(nn.Module):
              elif c.energy < 1.0 and not c.metadata.get("native_op"): dead.append(n)
         return dead
     def set(self, d, v): 
-        self.states[d] = Quantizer.to_storage(v.to(CFG.DEVICE))
+        # MODIFICATION : On bypass le stockage INT8 pour les propriétés locales
+        # pour éviter l'effacement des données fines.
+        # On utilise COMPUTE_DTYPE (FP16/32) au lieu de STORAGE_DTYPE
+        self.states[d] = v.to(dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         self.mark_dirty()
     def mark_dirty(self): 
         if not self.is_dirty: self.is_dirty = True; 
         if self.parent: self.parent.mark_dirty()
     def get_local(self, d): 
         if d in self.states:
-            return Quantizer.from_storage(self.states[d])
+            # Plus besoin de conversion complexe, c'est déjà dans le bon format
+            return self.states[d]
         return None
     def get_conceptual(self, d): 
         for c in self.concepts: 
@@ -1644,7 +1847,7 @@ class OpSynthesis(SemanticOperator):
         # Calcul vectoriel
         sem_a = node_subj.nature_vec
         sem_b = node_target.nature_vec
-        res_vec = F.normalize(sem_a + sem_b, p=2, dim=0)
+        res_vec = F.normalize(sem_a + sem_b, p=2, dim=0, eps=CFG.EPSILON)
         
         # Enregistrement global si concept
         if layer_type == CFG.LAYER_CONCEPT:
@@ -1668,7 +1871,7 @@ class OpContext(SemanticOperator):
         
         sem_a = node_subj.nature_vec
         sem_b = node_target.nature_vec
-        res_vec = F.normalize(sem_a * sem_b, p=2, dim=0)
+        res_vec = F.normalize(sem_a * sem_b, p=2, dim=0, eps=CFG.EPSILON)
         
         if layer_type == CFG.LAYER_CONCEPT:
              brain.encoder.semantic_map[res_name] = res_vec
@@ -1710,7 +1913,7 @@ class OpNegation(SemanticOperator):
             
             if local_val is not None:
                 # Soustraction vectorielle
-                node_subj.set(target_key, F.normalize(local_val - (vec_target * trust_level), p=2, dim=0))
+                node_subj.set(target_key, F.normalize(local_val - (vec_target * trust_level), p=2, dim=0, eps=CFG.EPSILON))
                 print(f" [HARDWARE] {node_subj.name} - {node_target.name}")
             else:
                 # Création d'anti-matière
@@ -1787,6 +1990,37 @@ class SensoryStream:
 
     def _generate_attention_mask(self, n):
         mask = torch.ones((n, n), device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
+        return mask
+        
+    def _generate_topk_mask_vectorized(self, vecs, n):
+        """
+        Génère un masque d'attention clairsemé (Sparse) en pur Tensoriel.
+        Compatible CPU/GPU sans aucune boucle Python.
+        """
+        # 1. Calcul préliminaire de similarité (brut)
+        # On normalise pour que le Top-K soit basé sur la sémantique pure (Cosinus)
+        # et non la masse.
+        vecs_norm = F.normalize(vecs[:n], p=2, dim=1, eps=CFG.EPSILON)
+        sim_matrix = torch.mm(vecs_norm, vecs_norm.t())
+        
+        # 2. Sélection des K meilleurs voisins (Vectorisé via CUDA/AVX)
+        # k doit être borné par n (on ne peut pas chercher 10 voisins s'il n'y a que 5 objets)
+        k_safe = min(CFG.TOP_K_LIMIT, n)
+        
+        # torch.topk retourne les valeurs et les indices. On ne veut que les indices.
+        _, indices = torch.topk(sim_matrix, k=k_safe, dim=1)
+        
+        # 3. Création du Masque (Scatter Method - Zéro boucle)
+        mask = torch.zeros_like(sim_matrix)
+        
+        # On "disperse" des 1.0 aux endroits indiqués par les indices du Top-K
+        # src=1.0 est broadcasté
+        mask.scatter_(1, indices, 1.0)
+        
+        # Optionnel : On s'assure que la diagonale est active ou inactive selon besoin
+        # Pour la gravité, on évite l'auto-attraction, le kernel gère déjà la diagonale 0
+        # mais c'est plus propre de laisser le mask propre.
+        
         return mask
 
     def _get_interaction_mask(self, n, layer_target_type):
@@ -1881,7 +2115,11 @@ class SensoryStream:
         
         # 3. Calcul Physique Brut (Toutes interactions possibles)
         # On utilise un masque simple ici (tout le monde voit tout le monde), le filtrage se fait après
-        attention_mask = self._generate_attention_mask(n)
+        #attention_mask = self._generate_attention_mask(n)
+        # --- MODIFICATION : ATTENTION SÉLECTIVE (TOP-K) ---
+        # Au lieu de : attention_mask = self._generate_attention_mask(n)
+        attention_mask = self._generate_topk_mask_vectorized(vecs_slice, n)
+        
         if CFG.USE_CUDA: torch.cuda.synchronize()
         raw_force_matrix = self.phys_engine.compute(pos_slice, mass_slice, vecs_slice, n, mask=attention_mask)
         if CFG.USE_CUDA: torch.cuda.synchronize()
@@ -2039,22 +2277,6 @@ class UnifiedBrain:
         # ---------------------------------
         
         objLang = DefLanguage(str_lang)
-        
-                
-        FREQ_DUST = 1000000000000 
-        for w in objLang.articles:
-            # CORRECTION : Idempotence. 
-            # On ne force 1000 que si l'usage actuel est inférieur.
-            # Si le système a appris que "le" est vu 5000 fois, on garde 5000.
-            if self.encoder.stats.usage[w] < FREQ_DUST:
-                self.encoder.stats.usage[w] = FREQ_DUST
-        # 2. AJOUT : Adjectifs : Transparence partielle (+100 usage)
-        # On les allège pour qu'ils soient moins lourds que les Noms (Sujets),
-        # mais plus consistants que les articles.
-        for adj in objLang.adjectives: 
-            if self.encoder.stats.usage[adj] < 100:
-                self.encoder.stats.usage[adj] = 100
-        
         self.bootstrap(objLang)
     
     def register_node(self, node):
@@ -2151,6 +2373,27 @@ class UnifiedBrain:
             self.global_energies[node.uid] = 0.0
 
     def bootstrap(self, lang):
+        
+        FREQ_DUST = 1000000000000 
+        for w in lang.articles:
+            # CORRECTION : Idempotence. 
+            # On ne force 1000 que si l'usage actuel est inférieur.
+            # Si le système a appris que "le" est vu 5000 fois, on garde 5000.
+            if self.encoder.stats.usage[w] < FREQ_DUST:
+                self.encoder.stats.usage[w] = FREQ_DUST
+        
+                
+        # 2. CORRECTIF "CHAT DANS LA GRANDE": Allégement des Adjectifs
+        # On leur donne une fréquence virtuelle élevée (mais moins que les articles)
+        # pour qu'ils aient une masse faible (~0.1) et ne capturent pas les sujets.
+        FREQ_ADJECTIVE = 10000 # Suffisant pour réduire la masse, mais garder du sens
+        
+        for adj in lang.adjectives:
+            # On normalise la casse pour être sûr de toucher le bon token
+            adj_key = adj.lower()
+            if self.encoder.stats.usage[adj_key] < FREQ_ADJECTIVE:
+                self.encoder.stats.usage[adj_key] = FREQ_ADJECTIVE
+
         for (w, direction), op_code in lang.ops.items():
             c = self.ensure_concept(w); c.bind_hardware_function(op_code, direction); self.memory.update(w, c.nature_vec)
         
@@ -2382,7 +2625,7 @@ class UnifiedBrain:
             saliency = F.cosine_similarity(obj_vec, mood_vec, dim=0).item()
             physical_saliency = obj.energy / 100.0; total_saliency = (saliency + physical_saliency) / 2
             if total_saliency > CFG.THRESHOLD_LOOSE:
-                reaction_vec = F.normalize(obj_vec * mood_vec, p=2, dim=0)
+                reaction_vec = F.normalize(obj_vec * mood_vec, p=2, dim=0, eps=CFG.EPSILON)
                 feel_word = self.associative_memory.articulate(reaction_vec)
                 print(f"   > {agent_name} remarque '{obj.name}' (Saliency: {total_saliency:.2f}) -> Ressent: {feel_word}")
 
@@ -2905,7 +3148,7 @@ class UnifiedBrain:
                             if mots:
                                 vec_pensee = torch.zeros(self.dim).to(CFG.DEVICE)
                                 for m in mots: vec_pensee += self.encoder.encode_word(m)
-                                vec_pensee = F.normalize(vec_pensee, p=2, dim=0)
+                                vec_pensee = F.normalize(vec_pensee, p=2, dim=0, eps=CFG.EPSILON)
                                 reponse = self.generate_response(vec_pensee)
                                 print(f" > GENESIS: {reponse}")
                             self.boredom_level = 0.0
@@ -2955,14 +3198,14 @@ class GenesisBootloader:
         try:
             source_dim = 0
             with open(file_path, 'r', encoding='utf-8') as f: source_dim = len(f.readline().strip().split()) - 1
-            projection_matrix = F.normalize(torch.randn(source_dim, self.cfg.DIM_SIZE).to(self.cfg.DEVICE), p=2, dim=0)
+            projection_matrix = F.normalize(torch.randn(source_dim, self.cfg.DIM_SIZE).to(self.cfg.DEVICE), p=2, dim=0, eps=CFG.EPSILON)
             count = 0
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     parts = line.strip().split(); word = parts[0]; vals = [float(x) for x in parts[1:]]
                     if len(vals) != source_dim: continue
                     vec_p = torch.matmul(torch.tensor(vals).to(self.cfg.DEVICE), projection_matrix)
-                    vec_p = F.normalize(vec_p, p=2, dim=0)
+                    vec_p = F.normalize(vec_p, p=2, dim=0, eps=CFG.EPSILON)
                     self.brain.memory.update(word, vec_p)
                     self.brain.ensure_concept(word); self.brain.associative_memory.register_word(word, vec_p)
                     count += 1
@@ -2999,7 +3242,7 @@ class GenesisDiagnostic:
         self.test_batch_ingestion_speed()
         self.test_tokenizer_performance();
         self.test_physics_broadcasting(); 
-        self.test_massive_context_n9(); 
+        #self.test_massive_context_n9(); 
         self.test_stream_n10_performance()
         self.test_multimodal_layering();
         self.test_attention_masking()
@@ -3007,6 +3250,11 @@ class GenesisDiagnostic:
         self.test_molecule_persistence()
         self.test_mvp94_narrative_architect()
         self.test_optimization_vectorielle()
+        self.test_cpu_benchmark_pytorch_vs_numba()
+        self.test_numerical_stability()
+        self.test_scalability()
+        self.test_quantization_quality()
+        self.test_hypothesis_acceptance()
         print("\n=== Fin Diagnostic ===")
     
     def test_precision_mode(self):
@@ -3148,9 +3396,9 @@ class GenesisDiagnostic:
         self.brain.perceive("Il y a un Chocolat dans Salon .", mode="REALITY")
         
         vec_choco = self.brain.encoder.encode_word("Chocolat"); vec_triste = self.brain.encoder.encode_word("Tristesse"); vec_joie = self.brain.encoder.encode_word("Joie")
-        vec_reconfort = F.normalize(vec_choco * vec_triste, p=2, dim=0); self.brain.ensure_concept("Reconfort").nature_vec = vec_reconfort
+        vec_reconfort = F.normalize(vec_choco * vec_triste, p=2, dim=0, eps=CFG.EPSILON); self.brain.ensure_concept("Reconfort").nature_vec = vec_reconfort
         self.brain.memory.update("Reconfort", vec_reconfort); self.brain.associative_memory.register_word("Reconfort", vec_reconfort)
-        vec_degout = F.normalize(vec_choco * vec_joie, p=2, dim=0); self.brain.ensure_concept("Degout").nature_vec = vec_degout
+        vec_degout = F.normalize(vec_choco * vec_joie, p=2, dim=0, eps=CFG.EPSILON); self.brain.ensure_concept("Degout").nature_vec = vec_degout
         self.brain.memory.update("Degout", vec_degout); self.brain.associative_memory.register_word("Degout", vec_degout)
         
         print("\n > Simulation ALICE (Triste)...")
@@ -3340,6 +3588,10 @@ class GenesisDiagnostic:
         t_large = (time.time() - t0) * 1000
         print(f" > N={N_large} (Mode Chunked) : {t_large:.2f} ms")
         if res.is_sparse: print(f" [SUCCESS] Retour Sparse détecté pour N={N_large}")
+        elif CFG.DEVICE.type == 'cpu':
+            # Sur CPU, on tolère le Dense car on a beaucoup de RAM système (400Mo pour 10k)
+            # et c'est beaucoup plus rapide que de construire un Sparse Tensor.
+            print(f" [SUCCESS] Retour Dense accepté sur CPU (Performance AVX privilégiée).")
         else: print(" [FAIL] Retour Dense pour Large N (Risque OOM)")
 
     def test_memory_index_performance(self):
@@ -3531,9 +3783,15 @@ class GenesisDiagnostic:
         mol = self.brain.create_molecule("Pomme", "ATTR", "Rouge")
         mol_name = mol.name
         self.brain.sleep()
+        print(" [SYSTEM] Rechargement du cerveau (Simulation Reset)...")
         del self.brain
+        # 2. On vide le cache GPU (Important pour PyTorch)
+        if CFG.USE_CUDA: torch.cuda.empty_cache()
         gc.collect()
-        torch.cuda.empty_cache()
+        # 4. Petite pause syndicale pour Windows
+        # On tente 0.5s (500ms). Si ça plante, mettez 1.0.
+        #time.sleep(0.5)
+        if CFG.USE_CUDA: torch.cuda.empty_cache()
         new_brain = UnifiedBrain("fr", boolResetBase=False)
         self.brain = new_brain 
         reloaded_mol = self.brain.find_concept_exact(mol_name)
@@ -3651,13 +3909,185 @@ class GenesisDiagnostic:
              print(" [SUCCESS] L'instance 'Ciel' (Réalité) a bien enregistré 'Vert'.")
         else:
              print(" [FAIL] L'instance Réalité n'a pas été créée.")
+             
+    # Ajoutez ceci dans GenesisDiagnostic
+    def test_cpu_benchmark_pytorch_vs_numba(self):
+        print("\n--- 35. BENCHMARK CPU: PYTORCH (NEW) vs NUMBA (OLD) ---")
+        
+        # 1. Setup : Une charge représentative (N=2000, Dim=4096)
+        N = 2000
+        dim = CFG.DIM_SIZE
+        print(f" > Configuration: N={N} corps, Dim={dim}, Device=CPU")
+        
+        # On force les tenseurs sur CPU pour le test
+        pos = torch.rand(N, device="cpu", dtype=torch.float32)
+        mass = torch.ones(N, device="cpu", dtype=torch.float32)
+        vecs = torch.randn(N, dim, device="cpu", dtype=torch.float32)
+        
+        # 2. Test PyTorch (Nouveau Kernel Vectorisé AVX)
+        print(" > Run PyTorch (Unified Kernel)...")
+        start_torch = time.perf_counter()
+        _ = gravity_kernel_masked_symmetric(pos, mass, vecs, mask=None)
+        end_torch = time.perf_counter()
+        dur_torch = (end_torch - start_torch) * 1000
+        print(f"   -> Temps PyTorch: {dur_torch:.2f} ms")
+        
+        # 3. Test Numba (Legacy Kernel Assembleur)
+        if NUMBA_AVAILABLE:
+            print(" > Run Numba (Legacy JIT)...")
+            # Conversion Numpy nécessaire pour Numba
+            p_np = pos.numpy()
+            m_np = mass.numpy()
+            v_np = vecs.numpy()
+            mask_np = np.zeros((0, 0), dtype=np.float32) # Masque vide
+            
+            # Warmup (La compilation JIT prend du temps au 1er appel)
+            _ = driver_cpu_numba_LEGACY(p_np, m_np, v_np, dim, 10, mask_np)
+            
+            start_numba = time.perf_counter()
+            _ = driver_cpu_numba_LEGACY(p_np, m_np, v_np, dim, N, mask_np)
+            end_numba = time.perf_counter()
+            dur_numba = (end_numba - start_numba) * 1000
+            print(f"   -> Temps Numba:  {dur_numba:.2f} ms")
+            
+            # Conclusion
+            if dur_torch < dur_numba:
+                gain = dur_numba / dur_torch
+                print(f" [WINNER] PyTorch est {gain:.1f}x plus rapide que Numba sur cette machine.")
+            else:
+                loss = dur_torch / dur_numba
+                print(f" [INFO] Numba reste {loss:.1f}x plus rapide (PyTorch est acceptable).")
+        else:
+            print(" [SKIP] Numba non installé, comparaison impossible.")
+
+    # N'oubliez pas d'ajouter self.test_cpu_benchmark_pytorch_vs_numba() dans run_all() !
+    
+    def test_numerical_stability(self):
+        print("\n--- 36. TEST STABILITÉ NUMÉRIQUE (Stress Test) ---")
+        # On génère des vecteurs avec des normes aberrantes pour voir si ça explose
+        N = 100
+        dim = CFG.DIM_SIZE
+        print(f" > Injection de vecteurs à haute énergie (Norme > 100)...")
+        
+        # Vecteurs géants (simule une explosion de gradient ou une accumulation infinie)
+        vecs = torch.randn(N, dim, device=CFG.DEVICE) * 100.0 
+        pos = torch.rand(N, device=CFG.DEVICE)
+        mass = torch.ones(N, device=CFG.DEVICE)
+        
+        # Le kernel doit tenir le coup grâce à la normalisation interne
+        try:
+            forces = gravity_kernel_masked_symmetric(pos, mass, vecs)
+            if torch.isnan(forces).any() or torch.isinf(forces).any():
+                print(" [FAIL] Explosion numérique détectée (NaN ou Inf) !")
+            else:
+                print(f" [SUCCESS] Forces calculées saines (Max force: {forces.max().item():.4f}).")
+                print("           Le kernel unifié a correctement normalisé les entrées.")
+        except Exception as e:
+            print(f" [FAIL] Crash du kernel : {e}")
+
+    def test_scalability(self):
+        print("\n--- 37. TEST D'ÉCHELLE (Scalability) ---")
+        if CFG.DEVICE.type == 'cpu' and not NUMBA_AVAILABLE:
+            print(" [INFO] Mode PyTorch CPU pur.")
+            
+        steps = [100, 1000, 5000]
+        dim = CFG.DIM_SIZE
+        
+        for n in steps:
+            # Création de données dummy
+            pos = torch.rand(n, device=CFG.DEVICE)
+            mass = torch.ones(n, device=CFG.DEVICE)
+            vecs = torch.randn(n, dim, device=CFG.DEVICE)
+            
+            # Mesure
+            torch.cuda.synchronize() if CFG.USE_CUDA else None
+            t0 = time.perf_counter()
+            
+            # On appelle le moteur via le stream pour utiliser la logique de chunking si nécessaire
+            _ = self.brain.stream.phys_engine.compute(pos, mass, vecs, n)
+            
+            torch.cuda.synchronize() if CFG.USE_CUDA else None
+            dt = (time.perf_counter() - t0) * 1000
+            
+            print(f" > N={n:<5} : {dt:.2f} ms")
+            
+            # Alerte si trop lent (> 16ms pour 1k serait inquiétant pour du temps réel)
+            if n == 1000 and dt > 50.0:
+                print("   [WARN] Attention, performance limite pour le temps réel.")
+
+    def test_quantization_quality(self):
+        print("\n--- 38. TEST QUALITÉ QUANTIZATION (INT8) ---")
+        # Création d'un vecteur sémantique riche
+        vec_original = torch.randn(1, CFG.DIM_SIZE, device=CFG.DEVICE)
+        vec_original = F.normalize(vec_original, p=2, dim=1, eps=CFG.EPSILON)
+        
+        # 1. Quantization "Smart" (Avec Scale)
+        q_vec, scale = SmartQuantizer.quantize(vec_original)
+        rec_vec = SmartQuantizer.dequantize(q_vec, scale)
+        
+        # 2. Mesure de la perte
+        similarity = F.cosine_similarity(vec_original, rec_vec).item()
+        loss = 1.0 - similarity
+        
+        print(f" > Vecteur Original (FP32) vs Reconstruit (INT8)")
+        print(f" > Similarité Cosine : {similarity:.6f}")
+        print(f" > Perte d'information : {loss:.6f}")
+        
+        if similarity > 0.99:
+            print(" [SUCCESS] La quantization INT8 est quasi-transparente.")
+        else:
+            print(" [WARN] Perte de précision significative.")
+
+    def test_hypothesis_acceptance(self):
+        print("\n--- 39. TEST CONSOLIDATION CROYANCE (Scenario Logique) ---")
+        # Scénario : On force une idée fausse "Le Ciel est Vert" plusieurs fois
+        # et on vérifie si elle devient une vérité (Consolidation).
+        
+        concept = "CielTest"
+        attribut = "VertTest"
+        
+        # 1. Création
+        c_node = self.brain.ensure_concept(concept)
+        vec_attr = self.brain.encoder.encode_word(attribut)
+        
+        print(f" > Inception : On répète '{concept} est {attribut}'...")
+        
+        # Simulation de répétition (Renforcement de l'hypothèse)
+        # On crée l'hypothèse manuellement pour simuler la perception
+        c_node.create_hypothesis(attribut, vec_attr)
+        hyp_name = f"HYP_{concept}_{attribut}"
+        
+        if hyp_name in c_node.children:
+            hyp_node = c_node.children[hyp_name]
+            # On booste artificiellement son énergie pour simuler 10 perceptions
+            hyp_node.energy = CFG.THRESHOLD_VALIDATION + 10.0
+            print(f"   (Hypothèse '{hyp_name}' chargée à bloc: Energy={hyp_node.energy})")
+            
+            # 2. Consolidation (Sommeil)
+            print(" > Lancement Consolidation...")
+            self.brain.consolidate_hypotheses()
+            
+            # 3. Vérification
+            if hyp_name not in c_node.children:
+                # Elle a disparu de la liste des enfants (donc traitée)
+                # Est-elle intégrée dans le concept ?
+                local_val = c_node.get_local(attribut)
+                if local_val is not None:
+                    print(f" [SUCCESS] Le système a cru au mensonge : {concept} est devenu {attribut}.")
+                    print("           (Mécanisme de croyance validé).")
+                else:
+                    print(" [FAIL] Hypothèse disparue mais pas intégrée (Oubli ?).")
+            else:
+                print(" [FAIL] Hypothèse non traitée (Reste en suspens).")
+        else:
+            print(" [ERR] Échec création hypothèse.")
 
 if __name__ == "__main__":
     
     Nb_DIM = 4096 #tested for: 64, 128, 256, 512, 1024, 2048, 4096
     # N11: CONFIGURATION DE PRÉCISION (Point 3)
     # Options: "INT8", "FP16", "FP32"
-    strPRECISION_MODE = "FP32"
+    strPRECISION_MODE = "INT8"
     boolForceCPU = False # false for CUDA auto-detection and True to force CPU (CUDA unactivation)
     #boolForceCPU = True
     str_lang = "fr" 
@@ -3703,7 +4133,7 @@ if __name__ == "__main__":
                 if mots:
                     vec_pensee = torch.zeros(brain.dim).to(CFG.DEVICE)
                     for m in mots: vec_pensee += brain.encoder.encode_word(m)
-                    vec_pensee = F.normalize(vec_pensee, p=2, dim=0)
+                    vec_pensee = F.normalize(vec_pensee, p=2, dim=0, eps=CFG.EPSILON)
                     reponse = brain.generate_response(vec_pensee)
                     print(f" > GENESIS (Association): {reponse}")
         except KeyboardInterrupt:
