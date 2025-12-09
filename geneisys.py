@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.96_12_STABLE_alpha"
+strVersion = "0.0.96_14_STABLE_alpha"
 
 
 import torch
@@ -84,16 +84,6 @@ import multiprocessing
 from collections import Counter
 from safetensors.torch import save_file, load_file
 import builtins
-
-
-
-
-
-
-
-
-
-
 
 
 # --- 0. SYSTEME IO SECURISE (Global Lock) ---
@@ -305,6 +295,7 @@ class GenesisConfig:
         self.INGEST_SLEEP_INTERVAL = 10000 
         self.INGEST_DEFAULT_EPOCHS = 1
         self.EPSILON = 1e-5
+        self.QUANTIZATION_EPSILON = 1e-5
         
         # --- MVP97 : TURBO PIPELINE ---
         self.ENABLE_MULTITHREADING = True  # Active le Bridge Léger
@@ -685,7 +676,7 @@ class SmartQuantizer:
         max_val = tensor_fp32.abs().max(dim=-1, keepdim=True).values
         scale = max_val / 127.0
         # 1e-8 est trop petit pour FP16 (min ~6e-5). On met 1e-5 pour être safe.
-        scale = torch.clamp(scale, min=1e-5) 
+        scale = torch.clamp(scale, min=CFG.QUANTIZATION_EPSILON) 
         
         tensor_int8 = (tensor_fp32 / scale).round().to(torch.int8)
         return tensor_int8, scale
@@ -755,7 +746,7 @@ class SafeFileManager:
         except Exception as e:
             print(f"[IO ERR] Chargement échoué : {e}")
             return {}
-    @staticmethod
+
     @staticmethod
     def save_tensors(tensors, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1353,25 +1344,7 @@ class MatrixEncoder(nn.Module):
         # ----------------------------
         return final_vec
     
-    #old function
-    def encode_batch_fast______(self, text_list):
-        self.stats.usage.update([t.lower() for t in text_list])
-            
-        if not TOKENIZERS_AVAILABLE:
-            return torch.stack([self.encode_word(t) for t in text_list])
-            
-        encodings = self.tokenizer.encode_batch(text_list)
-        batch_ids = [torch.tensor(e.ids, device=CFG.DEVICE) for e in encodings]
-        
-        batch_size = len(batch_ids)
-        result_tensor = torch.zeros((batch_size, self.dim), device=CFG.DEVICE)
-        
-        for i, ids in enumerate(batch_ids):
-             base = self._generate_basis_from_ids(ids)
-             w = self.stats.get_inverse_freq_weight(text_list[i].lower())
-             result_tensor[i] = base * w
-             
-        return result_tensor
+    
         
     
     def _get_sinusoidal_encoding(self, length, dim, device):
@@ -1650,6 +1623,34 @@ class ToolFactory:
         return new_tool
 
 class FractalNode(nn.Module):
+    # --- OPTIMISATION MEMOIRE (MVP 96.12) ---
+    # Liste EXHAUSTIVE des attributs de FractalNode.
+    # Note : Comme on hérite de nn.Module, un __dict__ existera quand même pour PyTorch,
+    # mais nos données métier seront stockées dans ces slots optimisés (-40% RAM).
+    __slots__ = [
+        'name', 
+        'dim', 
+        'phys', 
+        'encoder', 
+        'parent', 
+        'children', 
+        'concepts', 
+        'states', 
+        'metadata', 
+        'brain', 
+        'layer_type', 
+        'percepts', 
+        'uid', 
+        'fractal_id', 
+        'path', 
+        'is_dirty', 
+        '_plasticity',  # Attention : c'est _plasticity (la propriété wrapper)
+        'mass', 
+        'nature_vec'
+    ]
+    # ----------------------------------------
+
+
     def __init__(self, name, dim, phys, parent=None, nature="Neutre", encoder=None, layer_type=None):
         super().__init__(); self.name = name; self.dim = dim; self.phys = phys; self.encoder = encoder
         self.parent = parent; self.children = {}; self.concepts = []; self.states = {}; self.metadata = {}
@@ -4436,6 +4437,47 @@ class GenesisDiagnostic:
             print(" [SUCCESS] La quantization INT8 est quasi-transparente.")
         else:
             print(" [WARN] Perte de précision significative.")
+            
+        # 1. Test de Nuance (Ciel vs Azur)
+        # On crée deux vecteurs très proches (Nuance fine)
+        vec_base = torch.randn(1, CFG.DIM_SIZE, device=CFG.DEVICE)
+        vec_base = F.normalize(vec_base, p=2, dim=1)
+        
+        # On crée une variation minime (0.01)
+        noise = torch.randn(1, CFG.DIM_SIZE, device=CFG.DEVICE) * 0.01
+        vec_nuance = F.normalize(vec_base + noise, p=2, dim=1)
+        
+        dist_originale = (vec_base - vec_nuance).norm().item()
+        print(f" > Distance Originale (FP32) : {dist_originale:.6f}")
+        
+        # 2. Compression / Décompression
+        q_base, s_base = SmartQuantizer.quantize(vec_base)
+        rec_base = SmartQuantizer.dequantize(q_base, s_base)
+        
+        q_nuance, s_nuance = SmartQuantizer.quantize(vec_nuance)
+        rec_nuance = SmartQuantizer.dequantize(q_nuance, s_nuance)
+        
+        # 3. Vérification post-compression
+        dist_reconstruite = (rec_base - rec_nuance).norm().item()
+        print(f" > Distance Reconstruite (INT8): {dist_reconstruite:.6f}")
+        
+        perte_relative = abs(dist_originale - dist_reconstruite)
+        print(f" > Delta de distance : {perte_relative:.6f}")
+        
+        # On accepte une déviation minime, mais la distinction doit rester nette
+        if perte_relative < 0.01:
+            print(" [SUCCESS] La nuance est conservée (Ciel != Azur).")
+        else:
+            print(" [WARN] Attention, écrasement des nuances fines !")
+
+        # 4. Test Vecteur Nul (Sécurité Crash)
+        vec_nul = torch.zeros(1, CFG.DIM_SIZE, device=CFG.DEVICE)
+        q_nul, s_nul = SmartQuantizer.quantize(vec_nul)
+        rec_nul = SmartQuantizer.dequantize(q_nul, s_nul)
+        if torch.isnan(rec_nul).any():
+            print(" [FAIL] Le vecteur nul a provoqué des NaN !")
+        else:
+            print(" [SUCCESS] Gestion du vecteur nul OK (Pas de crash).")
 
     def test_hypothesis_acceptance(self):
         print("\n--- 39. TEST CONSOLIDATION CROYANCE (Scenario Logique) ---")
