@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.96_14_STABLE_alpha"
+strVersion = "0.0.96_16_STABLE_alpha"
 
 
 import torch
@@ -84,7 +84,7 @@ import multiprocessing
 from collections import Counter
 from safetensors.torch import save_file, load_file
 import builtins
-
+import traceback
 
 # --- 0. SYSTEME IO SECURISE (Global Lock) ---
 #CONSOLE_LOCK = threading.Lock()
@@ -312,6 +312,21 @@ class GenesisConfig:
         
         # --- ATTENTION SÉLECTIVE (Recap 12) ---
         self.TOP_K_LIMIT = 10  # Nombre max de voisins influents (Gravité Sparse)
+        
+        
+        # --- MVP98 : HEAVY BRIDGE CONFIG ---
+        # Nombre de processus lourds (CPU bound)
+        # On laisse 2 coeurs libres pour le système et le Main Thread/GPU driver
+        try:
+            cpu_count = multiprocessing.cpu_count()
+            self.HEAVY_WORKERS_COUNT = max(1, cpu_count - 2)
+        except NotImplementedError:
+            self.HEAVY_WORKERS_COUNT = 1
+            
+        self.HEAVY_QUEUE_SIZE = 100 # Taille tampon entre Process et Main Thread
+        
+        
+        
         
         self._calculate_dimensional_params()
 
@@ -1041,11 +1056,19 @@ class HybridMemoryCluster:
         if self.master_storage.device.type == 'cpu':
              storage_tensor = storage_vectors.detach().clone().to(device=CFG.STORAGE_DEVICE)
              if self.is_quantized:
-                 scales_tensor = batch_scales.detach().clone().to(device=CFG.STORAGE_DEVICE)
+                 #scales_tensor = batch_scales.detach().clone().to(device=CFG.STORAGE_DEVICE)
+                 # --- FIX CRASH TYPE MISMATCH (FP16 vs FP32) ---
+                 # Les scales doivent être en Float32 pour matcher self.master_scales
+                 # même si les vecteurs d'entrée étaient en FP16.
+                 scales_tensor = batch_scales.detach().clone().to(device=CFG.STORAGE_DEVICE, dtype=torch.float32)
+                 # ----------------------------------------------
         else:
              storage_tensor = storage_vectors.to(device=CFG.STORAGE_DEVICE)
              if self.is_quantized:
-                 scales_tensor = batch_scales.to(device=CFG.STORAGE_DEVICE)
+                 #scales_tensor = batch_scales.to(device=CFG.STORAGE_DEVICE)
+                 # --- FIX CRASH TYPE MISMATCH (FP16 vs FP32) ---
+                 scales_tensor = batch_scales.to(device=CFG.STORAGE_DEVICE, dtype=torch.float32)
+                 # ----------------------------------------------
              
         self.master_storage.index_copy_(0, indices_cpu, storage_tensor)
         if self.is_quantized:
@@ -3651,13 +3674,38 @@ class GenesisDiagnostic:
     
     def test_precision_mode(self):
         print(f"\n--- TEST N11: PRECISION MODE ({CFG.PRECISION_MODE}) ---")
+        # CORRECTION AUDIT : Utilisation de vecteurs normalisés pour simuler la réalité
+        # Un vecteur sémantique a toujours une norme de 1.0 (ou proche après decay)
         vec = torch.randn(CFG.DIM_SIZE, device=CFG.DEVICE)
+        vec = F.normalize(vec, p=2, dim=0, eps=CFG.EPSILON) # Normalisation unitaire
+        
+        # 1. Compression
         stored = Quantizer.to_storage(vec)
-        restored = Quantizer.from_storage(stored)
+        
+        # Si on est en INT8 via SmartQuantizer, on simule le cycle complet
+        if CFG.STORAGE_DTYPE == torch.int8:
+            q_vec, scale = SmartQuantizer.quantize(vec)
+            restored = SmartQuantizer.dequantize(q_vec, scale)
+            print(f" > Mode SmartQuantizer (INT8 + Scale)")
+        else:
+            restored = Quantizer.from_storage(stored)
+            
         print(f" > Type Stockage : {stored.dtype}")
         print(f" > Type Calcul : {restored.dtype}")
-        diff = (vec - restored).norm().item()
-        print(f" > Perte de Précision (Diff Norm) : {diff:.6f}")
+        
+        # 2. Mesure
+        # Distance Euclidienne
+        diff_norm = (vec - restored).norm().item()
+        # Similarité Cosinus (Le plus important pour la sémantique)
+        cosine_sim = F.cosine_similarity(vec, restored, dim=0).item()
+        
+        print(f" > Perte de Précision (Diff Norm) : {diff_norm:.6f}")
+        print(f" > Fidélité Sémantique (Cosine) : {cosine_sim:.6f}")
+        
+        if cosine_sim > 0.99:
+            print(" [SUCCESS] Précision suffisante pour la Physique Sémantique.")
+        else:
+            print(" [WARN] Perte de précision critique pour le sens.")
 
     def test_morphology(self):
         print("\n--- TEST 0: MORPHOLOGIE (MATRIX) ---")
@@ -4606,7 +4654,7 @@ if __name__ == "__main__":
     Nb_DIM = 4096 #tested for: 64, 128, 256, 512, 1024, 2048, 4096
     # N11: CONFIGURATION DE PRÉCISION (Point 3)
     # Options: "INT8", "FP16", "FP32"
-    strPRECISION_MODE = "FP32"
+    strPRECISION_MODE = "INT8"
     boolForceCPU = False # false for CUDA auto-detection and True to force CPU (CUDA unactivation)
     #boolForceCPU = True
     str_lang = "fr" 
