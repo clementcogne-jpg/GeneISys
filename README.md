@@ -72,7 +72,7 @@ graph TD
 Open a terminal in the project folder and install the required libraries:
 
 ```bash
-pip install torch numpy tokenizers numba safetensors
+pip install torch numpy tokenizers numba safetensors faiss-cpu lancedb pyarrow pandas
 ```
 
 ### Required Files
