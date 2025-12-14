@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.96_16_15_06i_STABLE_alpha"
+strVersion = "0.0.96_16_15_06l_STABLE_alpha"
 
 
 import torch
@@ -96,6 +96,16 @@ try:
 except ImportError:
     LANCEDB_AVAILABLE = False
     print(" [SYSTEME] WARN: LanceDB manquant. Installez avec 'pip install lancedb'.")
+
+
+try:
+    import orjson # [OPTI PICKLE]
+    ORJSON_AVAILABLE = True
+    print(" [SYSTEME] Orjson détecté (Turbo Sérialisation).")
+except ImportError:
+    ORJSON_AVAILABLE = False
+    print(" [SYSTEME] Orjson manquant. Fallback sur JSON standard (Plus lent).")
+
 
 # --- 0. SYSTEME IO SECURISE (Global Lock) ---
 #CONSOLE_LOCK = threading.Lock()
@@ -160,6 +170,13 @@ class GenesisConfig:
             self.DEVICE = torch.device("cpu")
         else:
             self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # --- OPTIMISATION GPU ---
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            # ------------------------
+         
+            
         self.STR_VERSION = str_version
         self.BASE_MEM_DIR = f'./memoire_GeneISys_vn{strVersion}'
         
@@ -182,7 +199,13 @@ class GenesisConfig:
         self.PHYSICS_CHUNK_SIZE = 1024 
         self.SPARSE_THRESHOLD = 0.01   
         self.MAX_SEQUENCE_LENGTH = 128 
-
+        
+        self.IO_CHUNK_SIZE = 64 * 1024 * 1024  # 64 MB (Lecture Disque Optimale)
+        self.BRIDGE_FEED_SIZE = 2000           # 2000 lignes (Injection Fluide dans la Queue)
+        self.SYSTEM_BUFFER = 10 * 1024 * 1024  # 10 MB (Buffer OS)
+        
+        
+        
         
         # N11: CONFIGURATION DE PRÉCISION (Point 3)
         # Options: "INT8", "FP16", "FP32"
@@ -1682,7 +1705,9 @@ class HybridMemoryCluster:
                 
                 # Conversion implicite si besoin (FP16 GPU -> FP32 CPU par exemple)
                 # .to() gère le transfert et le cast
-                self.master_storage.copy_(self.fast_index.to(CFG.STORAGE_DEVICE))
+                #self.master_storage.copy_(self.fast_index.to(CFG.STORAGE_DEVICE))
+                # non_blocking=True permet au GPU de continuer ses calculs pendant la copie
+                self.master_storage.copy_(self.fast_index.to(CFG.STORAGE_DEVICE, non_blocking=True))
                 
                 # Si on est en mode quantifié, on doit aussi synchroniser les scales si elles existent
                 # (Bien que dans l'architecture Lazy pure, fast_index soit souvent décompressé)
@@ -2002,10 +2027,17 @@ class MatrixEncoder(nn.Module):
         for i, e in enumerate(encodings):
             if len(e.ids) > 0:
                 padded_ids[i, :len(e.ids)] = torch.tensor(e.ids, device=CFG.DEVICE)
+        
+        # [OPTI2] TRANSFERT ASYNCHRONE VERS LE GPU
+        padded_ids_gpu = padded_ids.to(CFG.DEVICE, non_blocking=True)
 
+        # Projection (Sur GPU)
         # 2. Projection Sémantique (Lookup)
         # [Batch, MaxLen, Dim]
-        vectors = self.projection[padded_ids % self.projection.shape[0]]
+        vectors = self.projection[padded_ids_gpu % self.projection.shape[0]]
+        
+        
+        
         
         # 3. Encodage Positionnel "Standard" (Le remplacement des nombres magiques)
         # On génère la matrice de position [MaxLen, Dim]
@@ -2016,7 +2048,7 @@ class MatrixEncoder(nn.Module):
         
         # 4. Masquage du Padding
         # On ne veut pas que les '0' ajoutés influencent le vecteur final
-        mask = (padded_ids != 0).unsqueeze(-1).float()
+        mask = (padded_ids_gpu != 0).unsqueeze(-1).float()
         
         # 5. Combinaison & Scrambling
         # Dans la théorie VSA (Vector Symbolic Architecture), la multiplication (Hadamard product)
@@ -2035,13 +2067,15 @@ class MatrixEncoder(nn.Module):
             self.stats.get_inverse_freq_weight(t.lower()) 
             for t in text_list
         ], device=CFG.DEVICE).unsqueeze(1)
+        weights_gpu = weights.to(CFG.DEVICE, non_blocking=True)
+        
         
         # Application aux vecteurs
-        final_vecs = F.normalize(encoded_vecs, p=2, dim=1, eps=CFG.EPSILON) * weights
+        final_vecs = F.normalize(encoded_vecs, p=2, dim=1, eps=CFG.EPSILON) * weights_gpu
         
         # MODIFICATION : On retourne aussi les poids bruts !
         # Ils serviront de "Masse de base" pour la physique.
-        return final_vecs, weights.squeeze(1)
+        return final_vecs, weights_gpu.squeeze(1)
 
     
 
@@ -2902,7 +2936,10 @@ class TextIngestionHeavyBridge(GenesisBridge):
         self.heavy_out_q = ctx.Queue(maxsize=CFG.HEAVY_QUEUE_SIZE)
         
         self.workers = []
-        self.pending_markers = 0
+        self.pending_markers_to_receive = 0 # Ce qu'on attend du retour (Sortie)
+        
+        # Buffer spécifique pour l'injection progressive des marqueurs (Entrée)
+        self.markers_to_inject_count = 0
         
         print(f" [HEAVY-BRIDGE] Initialisation de {CFG.HEAVY_WORKERS_COUNT} processus lourds...")
         for i in range(CFG.HEAVY_WORKERS_COUNT):
@@ -2920,64 +2957,105 @@ class TextIngestionHeavyBridge(GenesisBridge):
                 w.terminate()
 
     def run(self):
-        print(f" [HEAVY-BRIDGE] Orchestrateur Démarré. Mode: {CFG.HEAVY_WORKERS_COUNT} CPUs.")
+        print(f" [HEAVY-BRIDGE] Orchestrateur V3 Démarré.")
+        current_stuck_item = None
         
         while not self.stop_event.is_set():
-            # A. DISTRIBUTION
+            # ===============================================================
+            # PHASE A : VIDAGE PRIORITAIRE (Consommation de la sortie)
+            # ===============================================================
             try:
-                while not self.in_q.empty():
-                    raw_data = self.in_q.get_nowait()
-                    if raw_data == "__SYNC_MARKER__":
-                        self.pending_markers = len(self.workers)
-                        for _ in range(len(self.workers)):
-                            self.heavy_in_q.put("__SYNC_MARKER__")
+                # On traite un paquet de résultats pour libérer les workers
+                burst = 0
+                # On vide tant qu'il y a des choses, jusqu'à une limite (pour ne pas bloquer l'entrée trop longtemps)
+                while not self.heavy_out_q.empty() and burst < 50:
+                    # [OPTI ORJSON] Réception brute (peut être bytes ou objet)
+                    raw_packet =self.heavy_out_q.get_nowait()
+                    
+                    
+                    # Décodage Intelligent
+                    packet = None
+                    if ORJSON_AVAILABLE and isinstance(raw_packet, bytes):
+                        packet = orjson.loads(raw_packet)
                     else:
-                        self.heavy_in_q.put(raw_data)
-            except queue.Empty:
-                pass
-
-            # B. AGREGATION (Séquentielle)
-            got_data = True
-            while got_data:
-                try:
-                    packet = self.heavy_out_q.get(timeout=0.005)
+                        packet = raw_packet # C'était déjà un dict (Pickle) ou un Marker (str)
+                    
+                    
+                    
+                    burst += 1
+                    
+                    
                     
                     if packet["type"] == "MARKER":
-                        self.pending_markers -= 1
-                        if self.pending_markers <= 0:
+                        self.pending_markers_to_receive -= 1
+                        # Si tous les workers ont répondu présents
+                        if self.pending_markers_to_receive <= 0:
+                            # On signale au Main Thread que tout est fini
                             self.out_q.put({"type": "MARKER"})
-                            self.pending_markers = 0
+                            self.pending_markers_to_receive = 0 # Sécurité
                             
                     elif packet["type"] == "BATCH_RESULT":
-                        data_list = packet["data"]
-                        
-                        # --- FIX CRITIQUE : TRAITEMENT SÉQUENTIEL (COMME LIGHT BRIDGE) ---
-                        # On ne fusionne PAS tout. On traite item par item (phrase par phrase).
-                        for item in data_list:
+                        # Transfert des données vers le Main Thread
+                        for item in packet["data"]:
                             tokens = item["tokens"]
                             if not tokens: continue
-                            
-                            # 1. Update Stats
-                            if "counts" in item:
-                                self.brain.encoder.stats.usage.update(item["counts"])
-                            
-                            # 2. Encodage GPU (Un paquet par phrase/chunk)
+                            if "counts" in item: self.brain.encoder.stats.usage.update(item["counts"])
                             vecs, weights = self.brain.encoder.encode_batch_fast(tokens)
-                            
-                            final_packet = {
-                                "type": "TEXT_BATCH",
-                                "vecs": vecs,
-                                "weights": weights,
-                                "tokens": tokens,
-                                "count": len(vecs)
-                            }
+                            final_packet = {"type": "TEXT_BATCH", "vecs": vecs, "weights": weights, "tokens": tokens, "count": len(vecs)}
                             self.out_q.put(final_packet)
-                            
-                except queue.Empty:
-                    got_data = False
+            except queue.Empty: pass
+            except Exception as e: print(f" [ERR HEAVY OUT] {e}")
+
+            # ===============================================================
+            # PHASE B : ALIMENTATION (Distribution vers l'entrée)
+            # ===============================================================
+            
+            # 1. Gestion de l'injection des MARQUEURS (Prioritaire sur les données)
+            if self.markers_to_inject_count > 0:
+                try:
+                    # On essaie d'injecter un marqueur
+                    self.heavy_in_q.put("__SYNC_MARKER__", timeout=0.005)
+                    # Si succès, on décrémente
+                    self.markers_to_inject_count -= 1
+                except queue.Full:
+                    # Si plein, on ne fait rien, on retentera au prochain tour de boucle
+                    pass
+                except Exception: pass
+                
+                # TANT QU'IL RESTE DES MARQUEURS A ENVOYER, ON NE LIT PAS DE NOUVELLES DONNEES
+                # Cela garantit que le marqueur agit comme une barrière étanche
+                continue 
+
+            # 2. Gestion des DONNEES (Seulement si aucun marqueur en attente d'injection)
+            
+            # Si on n'a rien en main, on va chercher dans la file principale
+            if current_stuck_item is None:
+                try:
+                    raw_data = self.in_q.get_nowait()
+                    
+                    if raw_data == "__SYNC_MARKER__":
+                        # DÉTECTION DU FLUSH : On arme la séquence d'injection
+                        self.pending_markers_to_receive = len(self.workers) # On attend N réponses
+                        self.markers_to_inject_count = len(self.workers)    # On doit envoyer N requêtes
+                        # On ne stocke pas le marqueur dans current_stuck_item, c'est géré par le compteur
+                    else:
+                        current_stuck_item = raw_data
+                except queue.Empty: pass
+
+            # Si on a une donnée standard bloquée, on essaie de la pousser
+            if current_stuck_item is not None:
+                try:
+                    self.heavy_in_q.put(current_stuck_item, timeout=0.005)
+                    current_stuck_item = None # Victoire, c'est passé
+                except queue.Full:
+                    pass # On garde l'item, on réessaiera après avoir vidé un peu la sortie (Phase A)
                 except Exception as e:
-                    print(f" [ERR HEAVY] {e}")
-                    got_data = False
+                    print(f" [ERR HEAVY IN] {e}")
+                    current_stuck_item = None
+            
+            # Petite pause pour ne pas brûler le CPU à 100% si tout est calme
+            if current_stuck_item is None and self.markers_to_inject_count == 0 and self.heavy_out_q.empty():
+                time.sleep(0.005)
 
 class PrototypeHeavyBridge(multiprocessing.Process):
     """
@@ -3070,7 +3148,19 @@ class HeavyIngestionWorker(multiprocessing.Process):
                             "raw_text": item["raw_text"]
                         })
                         
-                    self.out_q.put({"type": "BATCH_RESULT", "data": batch_data})
+                    payload = {"type": "BATCH_RESULT", "data": batch_data}
+                    
+                    if ORJSON_AVAILABLE:
+                        # [OPTI ORJSON] Sérialisation binaire ultra-rapide
+                        try:
+                            bytes_data = orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY)
+                            self.out_q.put(bytes_data)
+                        except Exception as e:
+                            print(f" [ERR ORJSON] {e}")
+                            self.out_q.put(payload) # Fallback Pickle
+                    else:
+                    
+                        self.out_q.put(payload)
                     
             except Exception:
                 continue
@@ -3156,7 +3246,7 @@ class SensoryStream:
             self._process_sequential_legacy(token_list_raw)
             
     
-    def flush(self):
+    def flush__(self):
         """Indispensable : Attend que le Worker ait fini son travail."""
         if not self.bridge: return
         
@@ -3166,6 +3256,41 @@ class SensoryStream:
             self.process_pending()
             time.sleep(0.01) # On laisse le CPU respirer
         print(" [STREAM] Sync terminée.")
+        
+    def flush(self):
+        """
+        [CORRECTIF MVP98] Version Robuste (Sentinel Pattern).
+        N'utilise plus .empty() qui est non fiable en multithreading.
+        Envoie un marqueur et attend son retour pour garantir le vidage total.
+        """
+        if not self.bridge: return
+
+        #print(" [STREAM] Flush Sync (Sentinel Pattern)...")
+        
+        # 1. On injecte le marqueur de fin dans le tuyau
+        self.bridge.in_q.put("__SYNC_MARKER__")
+        
+        # 2. On consomme tout jusqu'à retrouver le marqueur
+        while True:
+            try:
+                # Timeout de sécurité (5s suffit généralement)
+                packet = self.bridge.out_q.get(timeout=5.0)
+                
+                if packet["type"] == "MARKER":
+                    # C'est la preuve que tout ce qui précédait est fini
+                    break
+                
+                if packet["type"] == "TEXT_BATCH":
+                    # On traite les retardataires pour vider le buffer proprement
+                    # On redirige les logs pour ne pas polluer l'affichage si besoin
+                    with PrintRedirector(LOGGER):
+                        self._consume_physics_packet(packet)
+                    
+            except queue.Empty:
+                print(" [WARN] Flush Timeout (Le Worker semble bloqué ou trop lent).")
+                break
+                
+        #print(" [STREAM] Sync terminée.")
     
     
     def process_pending(self):
@@ -4572,50 +4697,65 @@ class GenesisBootloader:
     def __init__(self, config, brain): self.cfg = config; self.brain = brain
     def train_from_corpus_file(self, file_path, epochs=None, layer_type=CFG.LAYER_CONCEPT):
         if epochs is None: epochs = self.cfg.INGEST_DEFAULT_EPOCHS
-        print(f"\n [TRAINING] Ingestion Contrôlée (Threaded + Logs): {file_path}")
+        print(f"\n [TRAINING] Ingestion Optimisée (Large IO Buffer): {file_path}")
         if not os.path.exists(file_path): print(f" [ERR] Fichier introuvable."); return
         
-        CHUNK_LINES = 100 
-        batch_lines = []
-        total_lines = 0
+        # 1. Configuration des Buffers
+        IO_CHUNK_SIZE = CFG.IO_CHUNK_SIZE  # 64 MB (Lecture Disque Optimale)
+        BRIDGE_FEED_SIZE = CFG.BRIDGE_FEED_SIZE     # 2000 lignes (Injection Fluide dans la Queue)
+        SYSTEM_BUFFER = CFG.SYSTEM_BUFFER  # 10 MB (Buffer OS)
+        
+        total_lines_processed = 0
         start_global = time.time()
         
         for epoch in range(epochs):
             print(f" --- EPOQUE {epoch + 1}/{epochs} ---")
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
+                with open(file_path, 'r', encoding='utf-8', buffering=SYSTEM_BUFFER) as f:
                     while True:
-                        lines = f.readlines(1000) 
-                        if not lines: break
+                        # A. Lecture massive (Disque heureux)
+                        # Le dernier bloc sera lu ici, même s'il est tout petit.
+                        batch_lines = f.readlines(IO_CHUNK_SIZE)
                         
-                        for line in lines:
-                            if not line.strip(): continue
-                            batch_lines.append(line.strip().replace(".", " .")) 
-                            total_lines += 1
+                        if not batch_lines: 
+                            break # Fin du fichier
+                        
+                        # B. Nettoyage
+                        clean_batch = [line.strip().replace(".", " .") for line in batch_lines if line.strip()]
+                        
+                        if clean_batch:
+                            count = len(clean_batch)
+                            total_lines_processed += count
                             
-                            if len(batch_lines) >= CHUNK_LINES:
-                                # [CRITIQUE] sync_wait=True force l'attente du résultat
+                            # C. Injection progressive (Queue heureuse)
+                            # On découpe le gros bloc RAM en bouchées de 2000 lignes
+                            for i in range(0, count, BRIDGE_FEED_SIZE):
+                                sub_batch = clean_batch[i : i + BRIDGE_FEED_SIZE]
+                                
                                 self.brain.stream.receive_sequence(
-                                    batch_lines, 
+                                    sub_batch, 
                                     layer_type, 
                                     mode="TRAINING", 
                                     trust=1.0, 
-                                    sync_wait=True  # <--- CRUCIAL
+                                    sync_wait=False 
                                 )
-                                batch_lines = []
-                                
-                            if total_lines % self.cfg.INGEST_SLEEP_INTERVAL == 0: 
-                                print(f" [Check] {total_lines} lignes...")
-                                self.brain.sleep()
-                                
-                if batch_lines: 
-                    self.brain.stream.receive_sequence(batch_lines, layer_type, mode="TRAINING", trust=1.0, sync_wait=True)
-                    
-            except Exception as e: print(f" [ERR] {e}")
+                            
+                        if total_lines_processed % 100_000 == 0:
+                            print(f" [STREAM] {total_lines_processed} lignes injectées...")
+                self.brain.stream.flush()               
+            except Exception as e: 
+                print(f" [ERR READ] {e}")
+                traceback.print_exc()
         
-        # Le flush est moins critique ici grâce au sync_wait, mais on le garde par sécurité
+        # D. Attente finale (Flush)
+        # On s'assure que le Heavy Bridge a fini de digérer tout ce qu'on a injecté
         self.brain.stream.flush()
-        print(f" [TRAINING] Terminé en {time.time() - start_global:.2f}s."); self.brain.sleep()
+        
+        duration = time.time() - start_global
+        print(f" [TRAINING] Terminé. {total_lines_processed} lignes en {duration:.2f}s.")
+        if duration > 0:
+            print(f"            Débit moyen : {total_lines_processed/duration:.0f} lignes/sec.")
+        self.brain.sleep()
         
     def import_external_vectors(self, file_path):
         print(f"\n [IMPORT] Greffe de vecteurs: {file_path}")
@@ -4975,6 +5115,7 @@ class GenesisDiagnostic:
     def test_TRAINING_FILE_and_broca_empathie(self):
         print("\n--- 10. TEST BROCA: ARTICULATION with EMPATHIE & QUALIA SCENARIO ---")
         bootloader.train_from_corpus_file("genesis_curriculum_test.txt", epochs=5)
+        self.brain.stream.flush()
     
     def test_consolidation(self):
         print("\n--- 13. TEST CONSOLIDATION (MVP84) ---")
@@ -5274,7 +5415,11 @@ class GenesisDiagnostic:
         total_tokens = len(dummy_phrase.split()) * N_PHRASES
         raw_input = [dummy_phrase] * N_PHRASES
         start_time = time.time()
-        self.brain.stream.receive_sequence(raw_input, mode="TRAINING")
+        self.brain.stream.receive_sequence(raw_input, mode="TRAINING", sync_wait=False)
+        # Mesure du temps jusqu'au flush complet (Traitement réel)
+        # Si on ne flush pas, on mesure juste le temps de mise en file d'attente (faux positif)
+        # Et surtout, on évite de polluer le Test 30 !
+        self.brain.stream.flush()
         end_time = time.time()
         time_elapsed = end_time - start_time
         if time_elapsed == 0: time_elapsed = 0.001
