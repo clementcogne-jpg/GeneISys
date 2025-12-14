@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.96_16_15_06m_STABLE_alpha"
+strVersion = "0.0.97_STABLE_alpha"
 
 
 import torch
@@ -6373,3 +6373,4 @@ if __name__ == "__main__":
         # Peu importe si on a 1 cerveau, 10 threads ou si ça a planté,
         # la Config connait tout le monde et éteint la lumière.
         GenesisConfig.global_shutdown()
+
