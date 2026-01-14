@@ -98,9 +98,10 @@ standard Computer Science / Machine Learning equivalents.
 ================================================================================
 """
 
-strVersion = "0.0.96_16_15_06nQ_26_STABLE_alpha"
+strVersion = "0.0.96_16_15_06nQ_40_STABLE_alpha"
 
-
+import sys
+import platform
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -119,6 +120,12 @@ from collections import Counter, OrderedDict
 from safetensors.torch import save_file, load_file
 import builtins
 import traceback
+import subprocess
+import re
+
+
+
+
 
 # --- IMPORT LANCE DB ---
 try:
@@ -139,6 +146,9 @@ try:
 except ImportError:
     ORJSON_AVAILABLE = False
     print(" [SYSTEME] Orjson manquant. Fallback sur JSON standard (Plus lent).")
+
+
+
 
 
 # --- 0. SYSTEME IO SECURISE (Global Lock) ---
@@ -174,17 +184,63 @@ except ImportError:
     def prange(x): return range(x)
 
 
+
+
+def can_use_torch_compile_fast():
+    """
+    Vérifie instantanément si la compilation est possible sur l'OS actuel.
+    Ne lance AUCUN processus lourd. Regarde juste si les outils sont là.
+    """
+    os_type = platform.system() # 'Windows', 'Linux', 'Darwin' (Mac)
+
+    # --- CAS WINDOWS ---
+    if os_type == "Windows":
+        # Sur Windows, PyTorch a ABSOLUMENT besoin de 'cl.exe' (MSVC)
+        if shutil.which("cl") is not None:
+            return True, "Compilateur MSVC (cl.exe) détecté."
+        else:
+            return False, "Windows : Compilateur 'cl.exe' introuvable."
+
+    # --- CAS LINUX ---
+    elif os_type == "Linux":
+        # Sur Linux, PyTorch utilise souvent Triton (inclus) ou g++
+        # On vérifie la présence standard de g++ ou c++
+        if shutil.which("g++") is not None or shutil.which("c++") is not None:
+             return True, "Linux : Compilateur GCC/C++ détecté."
+        else:
+             # C'est rare qu'un Linux n'ait pas de compilateur, mais ça arrive (conteneurs légers)
+             return False, "Linux : Aucun compilateur (g++/c++) trouvé."
+
+    # --- CAS MAC (Darwin) ---
+    elif os_type == "Darwin":
+        # Sur Mac (MPS), torch.compile est encore très expérimental/instable
+        return False, "Mac : torch.compile désactivé par sécurité."
+
+    return False, f"OS inconnu ({os_type})."
+
+# --- UTILISATION ---
+
 # --- DETECTION PYTORCH 2.0 (TEST ACTIF ROBUSTE) ---
 try:
-    if hasattr(torch, "compile"):
-        def _dummy_fn(x): return x * 2
-        _compiled_fn = torch.compile(_dummy_fn)
-        _ = _compiled_fn(torch.tensor([1.0])) 
-        
-        TORCH_COMPILE_AVAILABLE = True
-        print(" [SYSTEME] Torch Compile disponible et VÉRIFIÉ (Acceleration CPU/GPU).")
+    TORCH_COMPILE_AVAILABLE = False
+    compilation_possible, raison = can_use_torch_compile_fast()
+
+    if compilation_possible:
+        print(f" [SYSTEME] ✅ Compilation possible : {raison}")
+        # model = torch.compile(model)
+        if hasattr(torch, "compile"):
+            def _dummy_fn(x): return x * 2
+            _compiled_fn = torch.compile(_dummy_fn)
+            _ = _compiled_fn(torch.tensor([1.0])) 
+            
+            TORCH_COMPILE_AVAILABLE = True
+            print(" [SYSTEME] Torch Compile disponible et VÉRIFIÉ (Acceleration CPU/GPU).")
+        else:
+            raise ImportError("Fonction torch.compile introuvable.")
     else:
-        raise ImportError("Fonction torch.compile introuvable.")
+        print(f" [SYSTEME] ⏩ Mode Standard (Eager) : {raison}")
+
+    
 except Exception as e:
     TORCH_COMPILE_AVAILABLE = False
     err_msg = str(e)
@@ -192,6 +248,8 @@ except Exception as e:
         print(f" [SYSTEME] Torch Compile DÉSACTIVÉ (Backend non supporté sur cet OS). Mode Standard.")
     else:
         print(f" [SYSTEME] Torch Compile DÉSACTIVÉ. Erreur technique : {e}")
+
+
 
 
 # --- CONFIGURATION (MVP94.5 - PERFORMANCE) ---
@@ -453,46 +511,7 @@ class GenesisConfig:
         print(f" [CONFIG] Architecture Ingestion Active : {mode_str}")
             
         
-        """
         
-        if name == "LEGACY":
-            # [COMPORTEMENT VERSION N]
-            # On active uniquement la Gravité Newtonienne.
-            # On coupe le Magnétisme (qui causait les hallucinations Poison->Poison)
-            self.base_weights["GRAVITY_KERNEL"] = 1.0
-            self.base_weights["MAGNETISM"] = 0.0 
-            self.base_weights["QUANTUM"] = 0.0
-            self.base_weights["ENTROPY"] = 0.0 # Pas de decay complexe dans le calcul de force immédiat
-            print(f" [PHYSICS] Context switched to LEGACY (Newtonian Only)")
-            
-        elif name == "STANDARD":
-            # Le profil par défaut de la version P (Mélange instable pour l'instant)
-            self.base_weights["GRAVITY_KERNEL"] = 0.6
-            self.base_weights["MAGNETISM"] = 0.4
-        elif name == "ORBITAL_LIFE": 
-            # LE PROFIL DE LA RÉALITÉ STABLE (MOUVEMENT PERPÉTUEL)
-            # 1. Structure
-            self.base_weights["GRAVITY"] = 1.0
-            # 2. Le Frein (Dissipation)
-            self.base_weights["THERMO"] = 0.5 
-            # 3. Le Moteur (Injection d'Énergie)
-            # Si Moteur ~= Frein, alors Vitesse = Constante > 0
-            self.base_weights["QUANTUM"] = 0.5  # Chaleur
-            self.base_weights["FLUIDS"] = 0.2   # Courant
-            
-        elif name == "DREAM_CHAOS":
-            # Beaucoup de moteur, peu de frein
-            self.base_weights["GRAVITY"] = 0.5
-            self.base_weights["QUANTUM"] = 2.0
-            self.base_weights["THERMO"] = 0.1
-            
-        elif name == "DEEP_FREEZE":
-            # Beaucoup de frein, zéro moteur (Maths)
-            self.base_weights["THERMO"] = 2.0
-            self.base_weights["ACTION"] = 1.0
-            self.base_weights["STRONG"] = 5.0 # Liaison rigide
-        
-        """
         self.DEFAULT_FIELD = "LEGACY"
         self.PARAM_FIELD = { "LEGACY" : {
                                                 # On active uniquement la Gravité Newtonienne.
@@ -543,10 +562,6 @@ class GenesisConfig:
                                                 "FLUIDS": 0.0
                                             }
                             }
-        
-        
-        
-        
         
         
         
@@ -682,8 +697,10 @@ class LawGravity_Legacy(PhysicsLaw):
         # Normalisation (Important pour la stabilité)
         vec_norm = F.normalize(vectors, p=2, dim=1, eps=CFG.EPSILON)
         
+        
         # 1. Matrice de Distance (Euclidienne = Vraie distance physique)
-        dists = torch.cdist(vec_norm, vec_norm, p=2)
+        calc_pos = vec_norm.to(dtype=torch.float32)
+        dists = torch.cdist(calc_pos, calc_pos, p=2)
         
         # 2. Matrice de Masses (m1 * m2)
         # masses est attendu comme tenseur (n,)
@@ -728,12 +745,8 @@ class gravity_kernel_masked_symmetric_Class(PhysicsLaw):
         # Au lieu de calculer le tenseur de différence [N, N, D] (qui pèse 64Go pour N=2000),
         # on utilise cdist qui calcule directement la matrice [N, N] (16Mo pour N=2000).
         # p=2 correspond à la distance Euclidienne (Norme L2).
-        if positions.device.type == 'cpu' and positions.dtype == torch.float16:
-             calc_pos = positions.float()
-        else:
-             calc_pos = positions
-        
-        
+
+        calc_pos = positions.to(dtype=torch.float32)
         dist_matrix = torch.cdist(calc_pos, calc_pos, p=2) + CFG.PHYSICS_EPSILON
         
         # 4. Calcul de la Gravité
@@ -932,6 +945,7 @@ class UniversalPhysicsContext:
         self.base_weights = {}
         self.layers = {}
         # Initialisation par défaut
+        self.name = name
         self.set_profile(name)
         
         for k in self.laws:
@@ -950,6 +964,7 @@ class UniversalPhysicsContext:
         Définit l'équilibre énergétique global.
         C'est ici qu'on crée la 'Vie' (Équilibre Thermo vs Quantique).
         """
+        self.name = name
         self.base_weights = {k: 0.0 for k in self.laws}
         
         if name in CFG.PARAM_FIELD:
@@ -961,18 +976,23 @@ class UniversalPhysicsContext:
             self.base_weights[NameLayerField] = LayerFieldValue[NameLayerField]
         
 
-    def add_layer(self, name, weights): self.layers[name] = weights
-    def remove_layer(self, name): self.layers.pop(name, None)
+    def add_layer(self, name, weights):
+        self.name = "custo"
+        self.layers[name] = weights
+    def remove_layer(self, name):
+        self.name = "custo"
+        self.layers.pop(name, None)
     
     
     
     def compute_all_forces(self, vecs, pos, mass, vels, mask=None):
         # 1. Préparation
         n, d = vecs.shape
+        spatial_dim = pos.shape[1] # 128
         # Accumulateur A : Le Graphe des Relations (Pour le Cerveau/Parseur)
         acc_relations = torch.zeros((n, n), device=vecs.device, dtype=vecs.dtype)
         # Accumulateur B : Le Vecteur Moteur (Pour la Physique/Euler)
-        acc_movement = torch.zeros((n, d), device=vecs.device, dtype=vecs.dtype)
+        acc_movement = torch.zeros((n, spatial_dim), device=vecs.device, dtype=vecs.dtype)
 
         # Calcul des poids des layers...
         final = self.base_weights.copy()
@@ -1004,7 +1024,7 @@ class UniversalPhysicsContext:
                     # Pour l'instant, on sépare bien les rôles.
 
                 # Cas 3 : La loi renvoie un Vecteur [N, D] (ex: Friction, Vent)
-                elif raw_output.dim() == 2 and raw_output.shape == (n, d):
+                elif raw_output.dim() == 2 and (raw_output.shape == (n, spatial_dim) or raw_output.shape == (n, d)):
                     acc_movement += raw_output * w
 
         # 3. PROJECTION FINALE (Le lien Physique -> Mouvement)
@@ -1016,114 +1036,7 @@ class UniversalPhysicsContext:
 
         return acc_relations, acc_movement
     
-    def compute_all_forces_pre(self, vectors, positions, masses, velocities, mask=None):
-        # 1. Calcul des poids finaux (Profil de base + Layers)
-        final = self.base_weights.copy()
-        for layer in self.layers.values():
-            for k, v in layer.items(): 
-                final[k] = max(0.0, final.get(k, 0) + v)
         
-        # 2. INITIALISATION STRICTE [N, N]
-        # On n'utilise pas 'None' pour éviter les erreurs si aucune loi n'est active.
-        # On n'utilise pas 'zeros_like(positions)' car c'est [N, D] (Mouvement).
-        # On veut une Matrice [N, N] pour le Parsing Legacy.
-        n = vectors.shape[0]
-        total_force = torch.zeros((n, n), device=vectors.device, dtype=vectors.dtype)
-        
-        for name, law in self.laws.items():
-            w = final.get(name, 0.0)
-            if w > 1e-4:
-                # Calcul de la force brute par la loi
-                # Pour Gravity_Legacy, cela renvoie bien [N, N]
-                current_force = law.compute_forces(vectors, positions, masses, velocities, mask, w)
-                
-                # 3. SÉCURITÉ DIMENSIONNELLE
-                # On n'accumule QUE si la loi renvoie le bon format [N, N].
-                # Cela filtre automatiquement les lois "modernes" qui renverraient des vecteurs [N, D].
-                if current_force.shape == total_force.shape:
-                    total_force += current_force * w
-                    
-        return total_force
-    
-    
-    
-    def compute_all_forces_pre(self, vectors, positions, masses, velocities, mask= None):
-        final = self.base_weights.copy()
-        # Fusion des layers (Profils émergents)
-        for layer in self.layers.values():
-            for k, v in layer.items(): 
-                final[k] = max(0.0, final.get(k, 0) + v)
-        
-        #total_force = torch.zeros_like(positions)
-        total_force = None
-        for name, law in self.laws.items():
-            w = final.get(name, 0.0)
-            if w > 1e-4:
-                if total_force is None:
-                    total_force = law.compute_forces(vectors, positions, masses, velocities, mask, w) * w
-                else:
-                    total_force += law.compute_forces(vectors, positions, masses, velocities, mask, w) * w
-        return total_force
-        
-        
-    def compute_all_forces_new(self, vectors, positions, masses, velocities, mask= None):
-        final = self.base_weights.copy()
-        # Fusion des layers (Profils émergents)
-        for layer in self.layers.values():
-            for k, v in layer.items(): 
-                final[k] = max(0.0, final.get(k, 0) + v)
-        
-        total_force = torch.zeros_like(positions)
-        for name, law in self.laws.items():
-            w = final.get(name, 0.0)
-            if w > 1e-4:
-                # Appel de ta fonction Legacy (elle renvoie [N, N])
-                raw_output = law.compute_forces(vectors, positions, masses, velocities, mask, w)
-                
-                # --- ADAPTATEUR INTELLIGENT ---
-                
-                # CAS 1 : La loi est moderne et renvoie déjà des vecteurs [N, 128]
-                if raw_output.shape == total_force.shape:
-                    total_force += raw_output * w
-                    
-                # CAS 2 : La loi est LEGACY (Scalaire [N, N]) -> On projette !
-                elif raw_output.dim() == 2 and raw_output.shape[0] == raw_output.shape[1]:
-                    # On a l'intensité (F), il manque la direction.
-                    # Astuce Barycentrique pour éviter O(N^2 * D) en mémoire :
-                    # Force_i = sum_j ( F_ij * (pos_j - pos_i) / dist_ij )
-                    # On pose Coeff_ij = F_ij / dist_ij
-                    
-                    # 1. On recalcule vite fait les distances (très rapide avec cdist)
-                    # en float 32 pour les CPU car non suporter en float16 pour CPU
-                    if positions.device.type == 'cpu' and positions.dtype == torch.float16:
-                         calc_pos = positions.float()
-                    else:
-                         calc_pos = positions
-                    
-                    
-                    
-                    dists = torch.cdist(calc_pos, calc_pos, p=2) + 1e-6
-                    
-                    # 2. On calcule le coefficient de pondération
-                    # raw_output est ton 'forces' (numérateur / dist)
-                    # On re-divise par dist pour normaliser le vecteur direction
-                    coeffs = raw_output / dists
-                    
-                    # 3. Projection Vectorielle (Matricielle Optimisée)
-                    # Terme Attractif : Vers où je suis tiré (Weighted Center of Mass)
-                    # [N, N] x [N, 128] -> [N, 128]
-                    
-                    pull = torch.mm(coeffs, calc_pos)
-                    
-                    # Terme Répulsif/Inertiel : Ma propre position pondérée
-                    # [N, 1] * [N, 128] -> [N, 128]
-                    push = calc_pos * coeffs.sum(dim=1, keepdim=True)
-                    
-                    # Résultante Vectorielle
-                    force_vector = (pull - push)
-                    
-                    total_force += force_vector * w
-        return total_force
 
 
 # ==============================================================================
@@ -1132,82 +1045,297 @@ class UniversalPhysicsContext:
 # ==============================================================================
 #  [NOUVEAU] MODULE: DYNAMIC TOOLS (Radar/Filter/Pipeline)
 # ==============================================================================
-class SemanticDevice:
-    def __init__(self, name, type="GENERIC"):
-        self.name = name; self.type = type; self.active = True
+
+
+class PipelineSemantic:
+    def __init__(self, name, brain, physicProfileObjOrStrName=CFG.DEFAULT_FIELD, type="GENERIC"):
+        self.name = name;
+        self.brain = brain
+        self.type = type;
+        self.active = True
+        
+        if isinstance(physicProfileObjOrStrName, ChunkedGravityEngine):
+            self.phys_engine = physicProfileObjOrStrName
+        else:
+            self.phys_engine = ChunkedGravityEngine(brain.dim, physicProfileName=physicProfileObjOrStrName)
+        self.phys_engine_name = self.phys_engine.name
+        
+    def UpdateUniversalPhysicsContext(self,physicProfileName=CFG.DEFAULT_FIELD):
+        self.phys_engine.UpdateUniversalPhysicsContext(physicProfileName)
+        
     def process(self, brain, vectors, positions, context): pass
-
-class RadarTool(SemanticDevice):
-    def __init__(self): super().__init__("STD_RADAR", "SENSOR")
-    def scan(self, current_idx, data, direction="FUTURE", k=3):
-        key = 'top_future_ind' if direction == "FUTURE" else 'top_past_ind'
-        return data[key][current_idx, :k]
-
-class FilterTool(SemanticDevice):
-    def __init__(self, force_th, mass_th):
-        super().__init__("STD_FILTER", "SELECTOR")
-        self.force_th = force_th; self.mass_th = mass_th
-    def select(self, current_idx, candidates, data):
-        masked_forces = data['masked_forces']; mass_slice = data['mass_slice']
-        for c_idx in candidates:
-            c_idx = c_idx.item()
-            if masked_forces[current_idx, c_idx].item() <= self.force_th: continue
-            if mass_slice[c_idx].item() <= self.mass_th: continue
-            return c_idx
-        return -1
-
-class ConjugatorTool(SemanticDevice):
-    def __init__(self): super().__init__("STD_BINDER", "ACTUATOR")
-    def execute(self, brain, op, subj_name, targ_name, context, idx_op, target_layer=0):
-        # On utilise le layer transmis par le pipeline (Réalité ou Concept)
-        node_s = brain.ensure_node_in_layer(subj_name, target_layer)
-        node_t = brain.ensure_node_in_layer(targ_name, target_layer)
+    
+    def _process_buffer_vectorized_pipeline(self, ctx):
+        """
+        Pipeline principal orchestrant la physique sémantique et la logique.
+        Refactorisé pour modularité et performance.
+        """
         
-        # L'opérateur s'exécute dans ce layer contextuel
-        op.execute(brain, node_s, node_t, layer_type=target_layer)
+        # ÉTAPE 1 : DYNAMIQUE (Compute Force)
+        # Calcule la matrice des interactions (Attention * Gravité * Layer)
+        # Retourne la matrice de force brute pour le mouvement et la logique
+        masked_forces, force_vectors = self._compute_interaction_forces(ctx)
+ 
+        # ÉTAPE 2 : INTÉGRATION (Complete Motif)
+        # Applique les lois de Newton (F=ma) et met à jour la mémoire (Write-Back)
+        # C'est ici que les concepts "bougent"
+        self._integrate_batch_dynamics(ctx, masked_forces, force_vectors)
+ 
+        # ÉTAPE 3 : LOGIQUE (Conjug Motif)
+        # enregistre les opérateurs sémantiques (Sujet-Verbe-Objet) ou motifs
+        # Uniquement si des forces significatives sont détectées
+        self._resolve_semantic_operators(ctx, masked_forces)
         
-        context.add_layer(f"BIND_{idx_op}", {"STRONG": 5.0})
+        # ÉTAPE 4 : LOGIQUE (Conjug Motif)
+        self._perform_motif_conjugaison(ctx)
+        
+        
+    
+        
+    def _generate_attention_mask(self, n):
+        mask = torch.ones((n, n), device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
+        return mask
+        
+    def _generate_topk_mask_vectorized(self, vecs, n):
+        """
+        Génère un masque d'attention clairsemé (Sparse) en pur Tensoriel.
+        Compatible CPU/GPU sans aucune boucle Python.
+        """
+        # 1. Calcul préliminaire de similarité (brut)
+        # On normalise pour que le Top-K soit basé sur la sémantique pure (Cosinus)
+        # et non la masse.
+        vecs_norm = F.normalize(vecs[:n], p=2, dim=1, eps=CFG.EPSILON)
+        sim_matrix = torch.mm(vecs_norm, vecs_norm.t())
+        
+        # 2. Sélection des K meilleurs voisins (Vectorisé via CUDA/AVX)
+        # k doit être borné par n (on ne peut pas chercher 10 voisins s'il n'y a que 5 objets)
+        k_safe = min(CFG.TOP_K_LIMIT, n)
+        
+        # torch.topk retourne les valeurs et les indices. On ne veut que les indices.
+        _, indices = torch.topk(sim_matrix, k=k_safe, dim=1)
+        
+        # 3. Création du Masque (Scatter Method - Zéro boucle)
+        mask = torch.zeros_like(sim_matrix)
+        
+        # On "disperse" des 1.0 aux endroits indiqués par les indices du Top-K
+        # src=1.0 est broadcasté
+        mask.scatter_(1, indices, 1.0)
+        
+        # Optionnel : On s'assure que la diagonale est active ou inactive selon besoin
+        # Pour la gravité, on évite l'auto-attraction, le kernel gère déjà la diagonale 0
+        # mais c'est plus propre de laisser le mask propre.
+        
+        return mask
 
-class GrammarPipeline(SemanticDevice):
-    def __init__(self, force_th, mass_th):
-        super().__init__("SVO_PIPELINE", "COMPOSITE")
-        self.radar = RadarTool(); self.filter = FilterTool(force_th, mass_th)
-        self.conjugator = ConjugatorTool()
+    def _get_interaction_mask(self, n, data_layer_buffer, layer_target_type):
+        """
+        Génère un masque tensoriel basé sur les règles de config (PHYSICS_RULES).
+        Gère le mapping dynamique des layers profonds (2000 -> REALITY).
+        """
+        current_types = data_layer_buffer
+        
+        # 1. Mapping du Layer demandé vers la Règle de Config
+        rule_key = layer_target_type
+        if layer_target_type >= CFG.DEPTH_REALITY:
+            rule_key = CFG.LAYER_REALITY # = 2000
+        elif layer_target_type < CFG.DEPTH_BUFFER:
+            rule_key = CFG.LAYER_CONCEPT # = 0
+ 
+        # 2. Récupération de la règle
+        if rule_key not in CFG.PHYSICS_RULES:
+            # Fallback : si pas de règle, on isole tout (pas d'interaction)
+            return torch.zeros((n, n), device=CFG.DEVICE)
+            
+        rule_targets = CFG.PHYSICS_RULES[rule_key]
+        
+        # 3. Construction du Masque Vectorisé
+        # On regarde pour chaque item si son type est autorisé dans la liste 'sources'
+        # Note: Dans PHYSICS_RULES, la liste définit QUI peut interagir avec le layer cible
+        allowed_tensor = torch.tensor(rule_targets, device=CFG.DEVICE)
+        
+        # Masque [N, 1] : Est-ce que l'élément i est compatible ?
+        # On utilise le broadcasting pour vérifier l'appartenance
+        is_compatible = (current_types.unsqueeze(1) == allowed_tensor).any(dim=1).float()
+        
+        # Le masque final est une matrice (N, N) : interaction active si les deux sont compatibles
+        return torch.mm(is_compatible.unsqueeze(1), is_compatible.unsqueeze(0))
 
-    def process(self, brain, vectors, positions, context):
-        if not hasattr(brain, 'latest_diagnostic_data'): return
-        data = brain.latest_diagnostic_data
-        active_indices = data.get('active_indices', [])
-        ops = data.get('ops', []); current_words = data['words']; op_dirs = data.get('op_dirs', [])
+        
+    def _compute_interaction_forces(self, ctx):
+        """
+        [COMPUTE FORCE]
+        Calcule la matrice d'interaction physique.
+        """
+        n = ctx['n']
+        # 3. MASQUES & CALCUL PHYSIQUE
+        # On utilise le Top-K Vectorisé pour l'attention physique
+        attention_mask = self._generate_topk_mask_vectorized(ctx["vecs"], n)
+        
+        # Masque Logique (Règles Layer)
+        layer_mask = self._get_interaction_mask(n,ctx["layers"], ctx["target_layer"])
+        final_mask = attention_mask * layer_mask
+        
+        if CFG.USE_CUDA: torch.cuda.synchronize()
+        # APPEL ENGINE (Sur les Slices)
+        # Note: raw_force_matrix est [N, N] (Matrice d'énergie)
+        raw_force_matrix, raw_force_mouvement = self.phys_engine.compute(ctx["pos"], ctx["mass"], ctx["vecs"], n, ctx["vel"], mask=final_mask)
+        if CFG.USE_CUDA: torch.cuda.synchronize()
+        
+        # 4. POST-TRAITEMENT (Legacy Logic)
+        # Gravité Relative
+        raw_force_matrix = raw_force_matrix * ctx["gravity"]
+        if raw_force_matrix.is_sparse: raw_force_matrix = raw_force_matrix.to_dense()
 
-        # [NOUVEAU] On récupère le buffer des layers
-        # Si absent (vieux code), on fallback sur 0 (Concept)
-        layers = data.get('layers', None)
+        # LE POINT CRITIQUE : On définit masked_forces
+        # C'est cette matrice qui contient la vérité physique (Masse * Sim * Gravité)
+        masked_forces = raw_force_matrix 
+        
+        # --- [REACTIVATION] INTEGRATION EULER (Mouvement) ---
+        # C'est ici que les concepts bougent physiquement !
+        force_vectors = raw_force_mouvement * ctx["gravity"]
+        
+        
+        return masked_forces, force_vectors
+        
+        
+    def _integrate_batch_dynamics(self, ctx, masked_forces, force_vectors):
+        """
+        [COMPLETE MOTIF]
+        Intégration d'Euler Semi-Implicite (Mise à jour Positions/Vitesses).
+        Commit immédiat dans la mémoire globale.
+        """
+        dt = 1.0 # Pas de temps
+        FRICTION = 0.90 # Amortissement pour éviter que ça explose (90% de conservation)
+        
+        # 1. Calcul Accélération (a = F / m)
+        # On sécurise la masse pour éviter la division par zéro
+        safe_mass = torch.clamp(ctx["mass"].unsqueeze(1), min=0.01)
+        acceleration = force_vectors / safe_mass
+        
+        # 2. Mise à jour Vitesse (v = v*friction + a*dt)
+        ctx["vel"].mul_(FRICTION).add_(acceleration * dt)
+        
+        # 3. Mise à jour Position (p = p + v*dt)
+        ctx["pos"].add_(ctx["vel"] * dt)
+        
+        # 4. COMMIT : Enregistrement dans le Cerveau
+        # C'est CRUCIAL. Si on ne fait pas ça, le mouvement reste dans le buffer temporaire
+        # et n'est jamais sauvegardé dans LanceDB ou Safetensors.
+        
+        # On utilise le mapping inverse (word -> uid) stocké dans layer_buffer ou via lookup
+        # Comme 'current_words' est aligné avec 'ctx["pos"]', on peut itérer.
+        # Pour aller VITE, on suppose que les indices du buffer correspondent aux positions chargées.
+        # Mais pour être 100% sûr, on refait un lookup rapide.
+        
+        # A. On récupère les IDs concernés
+        # ctx["uids"] doit être un LongTensor sur le même Device que la mémoire
+        
+        
+        # B. Écriture de masse des POSITIONS (1 seule commande)
+        # "Prends les valeurs de ctx["pos"] et mets-les aux indices ctx["uids"]"
+        #self.brain.memory_positions.index_copy_(0, ctx["uids"], ctx["pos"].to(torch.float16))
+        self.brain.memory_positions.index_copy_(0, ctx["uids"], ctx["pos"])
+        
+        
+        # C. Écriture de masse des VÉLOCITÉS (1 seule commande)
+        # C'est la ligne que tu as justement réclamée !
+        #self.brain.memory_velocities.index_copy_(0, ctx["uids"], ctx["vel"].to(torch.float16))
+        self.brain.memory_velocities.index_copy_(0, ctx["uids"], ctx["vel"])
+        # ----------------------------------------------------
+        
+        
+    def _resolve_semantic_operators(self, ctx, masked_forces):
+        """
+        [CONJUG MOTIF]
+        Analyse la matrice des masked_forces pour trouver des trios Sujet-Verbe-Objet
+        et exécuter les opérateurs logiques.
+        """
+        n = ctx['n']
+        # Seuil de déclenchement (Dynamique selon la gravité)
+        # 5. PARSING LOGIQUE (SVO) - RETOUR À LA LOGIQUE LEGACY
+        base_threshold = 0.001
+        force_threshold = max(base_threshold * ctx["gravity"], 1e-6)
+        mass_threshold = CFG.MASS_THRESHOLD * ctx["gravity"]
 
+        # Détection des Agents Actifs
+        max_forces = masked_forces.max(dim=1).values
+        is_operator_mask = (ctx["mass"] >= (CFG.MASS_OPERATOR - 1.0))
+        has_strong_interaction = (max_forces > force_threshold)
+        
+        active_agents_mask = is_operator_mask & has_strong_interaction
+        active_indices = torch.nonzero(active_agents_mask, as_tuple=False).squeeze(1).cpu().numpy()
+        
+        if len(active_indices) == 0: return
 
+        indices = torch.arange(n, device=CFG.DEVICE)
+        
+        # --- CORRECTION MAJEURE : On utilise masked_forces (Physique) pour le Top-K ---
+        # C'est ça qui manquait. On ne recalcule pas sim_analysis.
+        # On regarde : "Où la force est-elle la plus forte ?"
+        
+        forces_past = masked_forces * (indices.unsqueeze(1) > indices.unsqueeze(0))   # Influence venant d'avant (j < i)
+        forces_future = masked_forces * (indices.unsqueeze(1) < indices.unsqueeze(0)) # Influence venant d'après (j > i)
+        
+        # On prend les indices des forces MAXIMALES
+        k_val = min(3, n)
+        top_past_ind = torch.topk(forces_past, k=k_val, dim=1).indices.cpu().numpy()
+        top_future_ind = torch.topk(forces_future, k=k_val, dim=1).indices.cpu().numpy()
+        
+        
+        list_command = []
+        target_layer = ctx["target_layer"]
+        effective_trust = ctx["effective_trust"]
+        # 6. BOUCLE D'EXECUTION (Le Cerveau)
         for i in active_indices:
-            op = ops[i]
+            op = ctx["ops"][i]
             if not op: continue
-            cands_fut = self.radar.scan(i, data, "FUTURE")
-            cands_past = self.radar.scan(i, data, "PAST")
-            targ_idx = self.filter.select(i, cands_fut, data)
-            subj_idx = self.filter.select(i, cands_past, data)
-
+            
+            # Recherche Cible (Dans le futur) basé sur la FORCE PHYSIQUE
+            targ_idx = -1
+            for k in range(k_val):
+                c_idx = top_future_ind[i, k]
+                # On vérifie si la force brute dépasse le seuil
+                if masked_forces[i, c_idx].item() > force_threshold:
+                    if ctx["mass"][c_idx] > mass_threshold:
+                        targ_idx = c_idx; break
+            
+            # Recherche Sujet (Dans le passé) basé sur la FORCE PHYSIQUE
+            subj_idx = -1
+            for k in range(k_val):
+                c_idx = top_past_ind[i, k]
+                if masked_forces[i, c_idx].item() > force_threshold:
+                    if ctx["mass"][c_idx] > mass_threshold:
+                        subj_idx = c_idx; break
+            
             if subj_idx != -1 and targ_idx != -1:
-                subj_name = current_words[subj_idx]; targ_name = current_words[targ_idx]
+                subj_name = ctx["words"][subj_idx]
+                target_name = ctx["words"][targ_idx]
+                node_s = ctx["nodes"][subj_idx]
+                node_t = ctx["nodes"][targ_idx]
                 
-                # Détermination du Layer Cible
-                # La règle : Le résultat de l'action hérite du layer du SUJET
-                target_layer = 0 # Default Concept
-                if layers is not None:
-                    # .item() car c'est un tenseur
-                    target_layer = layers[subj_idx].item()
+                d = ctx["op_dirs"][i]
+                if d == "><":
+                    subj_name, target_name = target_name, subj_name
+                    node_s, node_t = node_t, node_s
                 
-                if op_dirs[i] == "><":
-                    subj_name, targ_name = targ_name, subj_name
-                    # Si on inverse (Passif), on prend le layer de la cible originale qui devient sujet
-                    if layers is not None: target_layer = layers[targ_idx].item()
-                self.conjugator.execute(brain, op, subj_name, targ_name, context, i, target_layer)
+                
+                try:
+                    ctx["list_command_text"].append({"ope": op,"subject" : node_s, "target" : node_t , "layer" : target_layer, "trust_level": effective_trust})
+                    #op.execute(self.brain, node_s, node_t, layer_type=target_layer, trust_level=effective_trust)
+                except Exception as e:
+                    print(f" [EXEC ERR] {e}")
+                    
+        
+    def _perform_motif_conjugaison(self,ctx):
+        motif_list = ctx["list_command_text"]
+        for dict_motif_data in motif_list:
+            #dict_motif_data = motif_list[i]
+            dict_motif_data["ope"].execute(self.brain,
+                                            dict_motif_data["subject"],
+                                            dict_motif_data["target"],
+                                            layer_type=dict_motif_data["layer"],
+                                            trust_level=dict_motif_data["trust_level"])
+    
 
 # ==============================================================================
 #  INTEGRATION DANS LE MOTEUR
@@ -1286,16 +1414,16 @@ class PrintRedirector:
         self.logger.wait_until_empty()
 
     
-    
+"""
 def gravity_kernel_masked_symmetric(positions: torch.Tensor, 
                                     masses: torch.Tensor, 
                                     vecs: torch.Tensor,
                                     mask: torch.Tensor = None) -> torch.Tensor:
-    """
+    ""
     Noyau Physique Unifié (CPU/GPU Compatible).
     Utilise la similarité Cosine et le Clamping pour la stabilité numérique.
     Remplace l'ancienne logique dot-product pure qui causait des NaN.
-    """
+    ""
     # 1. Normalisation pour stabilité (Cosine Similarity)
     # eps=1e-8 évite la division par zéro si un vecteur est nul
     vecs_norm = F.normalize(vecs, p=2, dim=1, eps=CFG.EPSILON)
@@ -1327,6 +1455,7 @@ def gravity_kernel_masked_symmetric(positions: torch.Tensor,
         
     forces.fill_diagonal_(0.0)
     return forces
+"""
 
 # --- 1. KERNELS PHYSIQUES (OPTIMISATION SYMETRIQUE & VECTORISEE) ---
 @jit(nopython=True, parallel=True, fastmath=True)
@@ -1379,6 +1508,7 @@ class ChunkedGravityEngine:
         self.spatial_dim = CFG.SPATIAL_DIM
         self.mode = "CPU"
         self.compute_stream = None
+        self.name = physicProfileName
         self.optimized_kernel = UniversalPhysicsContext(name=physicProfileName) 
         win = CFG.CUDA_GRAPH_WINDOW_SIZE
         self.window_size = win
@@ -1386,6 +1516,7 @@ class ChunkedGravityEngine:
         self.init_data = False
         
     def UpdateUniversalPhysicsContext(self,name):
+        self.name = name
         self.optimized_kernel.set_profile(name)
 
     def update_window(self, new_window_size=None):
@@ -1597,8 +1728,28 @@ class ChunkedGravityEngine:
     
     
             
-# --- UTILITAIRES ---
-
+# --- UTILITAIRES (BEGIN)---
+def audit_tensor(tensor, context_msg):
+    """
+    LE PIEGE A LOUP : Vérifie si un vecteur est corrompu.
+    Déclenche une alerte + Call Stack si on détecte une anomalie.
+    """
+    if tensor is None: return
+    
+    # 1. Détection Vecteur Géant (Symptôme INT8 lu comme Float sans division)
+    # Un vecteur normalisé a des valeurs < 1.0. Si on a 50 ou 127, c'est le BUG.
+    max_val = tensor.abs().max().item()
+    if max_val > 5.0: 
+        print(f"\n[🚨 ALERTE CRITIQUE] VECTEUR GÉANT DÉTECTÉ ({max_val:.2f})")
+        print(f"Context: {context_msg}")
+        print("TRACEBACK (D'où ça vient ?) :")
+        traceback.print_stack() # <--- C'est ça que vous voulez
+        
+    # 2. Détection Vecteur Mort (Symptôme '???')
+    if max_val == 0.0:
+        print(f"\n[⚠️ ALERTE] VECTEUR NUL (VIDE) DÉTECTÉ")
+        print(f"Context: {context_msg}")
+        # traceback.print_stack() # Decommenter si besoin
 
 def print_vram_status(tag=""):
     if not torch.cuda.is_available():
@@ -1621,7 +1772,202 @@ def print_vram_status(tag=""):
     print(f"    PyTorch Alloué (Tenseurs): {alloc_gb:.2f} GB | PyTorch Réservé (Cache): {reserved / (1024**3):.2f} GB")
     print("-" * 40)
 
+
+def get_hardware_info():
+    """
+    Récupère : CPU (Modèle + Cœurs), GPU.
+    Utilise une approche hybride (Commandes système > Fallback Python pur).
+    """
+    current_os = platform.system()
+    
+    # Dictionnaire de résultat
+    info = {
+        "os": current_os,
+        "cpu_model": "Inconnu",
+        "cpu_cores_logical": os.cpu_count(), # Très robuste (Python natif)
+        "cpu_cores_physical": "Inconnu (Nécessite droits/commandes)",
+        "gpu_model": "Non détecté"
+    }
+ 
+    # --- SOUS-FONCTION 1 : Méthode "Active" (Commandes Système) ---
+    def _get_via_commands():
+        c_model, c_phys, g_model = None, None, None
+        
+        try:
+            if current_os == "Windows":
+                # CPU Modèle
+                cmd = "wmic cpu get name"
+                res = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+                c_model = res.split('\n')[1].strip()
+                
+                # CPU Cores Physiques
+                cmd = "wmic cpu get NumberOfCores"
+                res = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+                c_phys = res.split('\n')[1].strip()
+ 
+                # GPU
+                cmd = "wmic path win32_VideoController get name"
+                res = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+                lines = res.split('\n')[1:]
+                g_model = ", ".join([l.strip() for l in lines if l.strip()])
+ 
+            elif current_os == "Linux":
+                # CPU Modèle
+                cmd = "cat /proc/cpuinfo | grep 'model name' | head -n 1"
+                res = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+                c_model = res.split(":")[1].strip()
+                
+                # CPU Cores Physiques (Astuce via grep sur 'cpu cores' d'un seul socket)
+                cmd = "grep 'cpu cores' /proc/cpuinfo | head -1"
+                res = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+                c_phys = res.split(":")[1].strip()
+ 
+                # GPU
+                cmd = "lspci | grep -i 'vga\\|3d'"
+                res = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+                gpu_list = []
+                for line in res.split('\n'):
+                    if line:
+                        parts = line.split(':')
+                        if len(parts) >= 3: gpu_list.append(parts[-1].strip())
+                g_model = ", ".join(gpu_list) if gpu_list else None
+ 
+            elif current_os == "Darwin": # macOS
+                # CPU Modèle
+                cmd = "sysctl -n machdep.cpu.brand_string"
+                c_model = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode().strip()
+                
+                # CPU Cores Physiques
+                cmd = "sysctl -n hw.physicalcpu"
+                c_phys = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode().strip()
+ 
+                # GPU
+                cmd = "system_profiler SPDisplaysDataType | grep 'Chipset Model'"
+                res = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+                g_model = res.split(":")[1].strip()
+ 
+        except Exception:
+            pass
+            
+        return c_model, c_phys, g_model
+ 
+    # --- SOUS-FONCTION 2 : Méthode "Fallback" (Mode Dégradé) ---
+    def _get_via_fallback():
+        # Pour le CPU Model uniquement (les cores logiques sont déjà gérés par os.cpu_count)
+        c_model = "Inconnu"
+        try:
+            if current_os == "Linux" and os.path.exists("/proc/cpuinfo"):
+                with open("/proc/cpuinfo", "r") as f:
+                    for line in f:
+                        if "model name" in line:
+                            c_model = line.split(":")[1].strip()
+                            break
+            elif current_os == "Windows":
+                c_model = os.environ.get("PROCESSOR_IDENTIFIER", platform.processor())
+            else:
+                c_model = platform.processor()
+        except:
+            pass
+        return c_model
+ 
+    # --- ORCHESTRATION ---
+    
+    # 1. Tentative Active
+    cmd_model, cmd_phys, cmd_gpu = _get_via_commands()
+    
+    if cmd_model: info["cpu_model"] = cmd_model
+    if cmd_phys:  info["cpu_cores_physical"] = cmd_phys
+    if cmd_gpu:   info["gpu_model"] = cmd_gpu
+    
+    # 2. Fallback si le modèle CPU est vide
+    if info["cpu_model"] == "Inconnu":
+        info["cpu_model"] = _get_via_fallback()
+ 
+    return info
+ 
+# --- Exemple d'utilisation ---
+def print_hardware_information():
+    hw = get_hardware_info()
+    print(" === INFO MATÉRIEL ===")
+    print(f" OS           : {hw['os']}")
+    print(f" CPU Modèle   : {hw['cpu_model']}")
+    print(f" Cœurs (Log)  : {hw['cpu_cores_logical']} (Threads)")
+    print(f" Cœurs (Phys) : {hw['cpu_cores_physical']} (Réels)")
+    print(f" GPU          : {hw['gpu_model']}")
+    print(" ====================")
+ 
+
+# --- UTILITAIRES (END)---
+
 class Quantizer:
+    """
+    Gère la conversion entre les formats de calcul et de stockage.
+    Version Sécurisée : Idempotente (Refuse de re-compresser du INT8).
+    """
+    
+    # Constante de scaling : mappe [-1.0, 1.0] vers [-127, 127]
+    SCALE_FACTOR = 1000.0 
+
+    @staticmethod
+    def to_storage(tensor):
+        """
+        Prépare un tenseur pour le stockage.
+        Sécurité : Si l'entrée est déjà en INT8, on la renvoie telle quelle.
+        """
+        if tensor is None:
+            return None
+            
+        # --- SECURITE ANTI-DOUBLE COMPRESSION ---
+        # C'est votre idée : si c'est déjà du int8, on ne touche à rien !
+        if tensor.dtype == torch.int8:
+            return tensor
+        # ----------------------------------------
+            
+        # --- BRANCHE COMPRESSION (INT8) ---
+        if CFG.PRECISION_MODE == "INT8":
+            # 1. Clamp pour sécurité (évite l'overflow int8 sur les outliers)
+            # 2. Scale
+            # 3. Round & Cast
+            # 1. Amplification (On sauve les détails)
+            scaled = tensor * Quantizer.SCALE_FACTOR
+            
+            # 2. SECURITE (Le Clamping)
+            # Tout ce qui dépasse 127 est ramené à 127.
+            # On perd l'info sur les pics, mais on sauve 99% du vecteur ET on évite le bug.
+            clamped = torch.clamp(scaled, -127.0, 127.0)
+            # 3. Stockage
+            return clamped.round().to(torch.int8)
+            
+            
+            #return (torch.clamp(tensor, -1.0, 1.0) * Quantizer.SCALE_FACTOR).round().to(torch.int8)
+        
+        # --- BRANCHE PASS-THROUGH (Standard) ---
+        # En FP32/FP16, on renvoie l'objet tel quel (Zero-Copy si possible).
+        return tensor
+
+    @staticmethod
+    def from_storage(tensor):
+        """
+        Prépare un tenseur stocké pour le calcul immédiat.
+        Garantit que le retour est toujours en CFG.COMPUTE_DTYPE.
+        """
+        if tensor is None:
+            return None
+            
+        # 1. Gestion de la décompression INT8
+        if tensor.dtype == torch.int8:
+            # On cast d'abord vers le format de calcul pour pouvoir diviser
+            t_float = tensor.to(CFG.COMPUTE_DTYPE)
+            return t_float / Quantizer.SCALE_FACTOR
+            
+        # 2. Gestion de la compatibilité de type (ex: Load FP16 -> Run FP32)
+        if tensor.dtype != CFG.COMPUTE_DTYPE:
+            return tensor.to(CFG.COMPUTE_DTYPE)
+            
+        return tensor
+
+
+class QuantizerOld:
     @staticmethod
     def to_storage(tensor): return tensor.to(CFG.STORAGE_DTYPE)
     @staticmethod
@@ -1836,55 +2182,31 @@ class Chronos(nn.Module):
 
 class AssociativeMemory:
     def __init__(self, brain):
-        self.brain = brain; self.vocab_vectors = None; self.vocab_words = []; self.is_dirty = False
+        self.brain = brain; self.is_dirty = False
     def register_word(self, word, vector): self.is_dirty = True
     # [Dans la classe AssociativeMemory]
 
+    
+
     def _refresh_lexicon(self):
-        if not self.is_dirty and self.vocab_vectors is not None: return
-        
-        # On récupère les mots connus
-        words = list(self.brain.encoder.semantic_map.keys())
-        if not words: return
-        
-        clean_words = [w for w in words if not w.startswith(("0::EVT_", "0::HYP_"))]
-        vecs = []
-        
-        for w in clean_words:
-            # --- FIX: Cohérence Mémoire (Hot Path) ---
-            # Avant : on lisait raw_v = self.brain.encoder.semantic_map[w] (Périmé)
-            # Après : on utilise le getter intelligent qui priorise le fast_index (Frais)
-            layer, nm = HybridMemoryCluster._parse_key(w)
-            v = self.brain.encoder.get_semantic_vector(nm, layer)
-            # -----------------------------------------
-            
-            # get_semantic_vector renvoie déjà du COMPUTE_DTYPE, on normalise juste
-            if v.is_sparse: v = v.to_dense()
-            vecs.append(F.normalize(v, p=2, dim=0, eps=CFG.EPSILON))
-            
-        if vecs:
-            self.vocab_vectors = torch.stack(vecs).to(CFG.DEVICE)
-            self.vocab_words = clean_words
-            self.is_dirty = False
-            
-            
+        pass
+
     def articulate(self, vector, anti_parrot=True):
-        self._refresh_lexicon()
-        if self.vocab_vectors is None: return "???"
-        if vector.dim() == 1: vector = vector.unsqueeze(0)
-        query = F.normalize(vector.to(CFG.COMPUTE_DTYPE), p=2, dim=1, eps=CFG.EPSILON)
-        scores = torch.mm(query, self.vocab_vectors.t()).squeeze(0)
-        k_val = min(2, len(scores))
-        best_scores, best_indices = torch.topk(scores, k=k_val)
-        if len(best_indices) == 0: return "???"
-        best_idx = best_indices[0].item()
-        if anti_parrot and best_scores[0].item() > 0.99 and len(best_indices) > 1:
-             best_idx = best_indices[1].item()
-        #print(f'aaaaaaa: {best_idx}')
-        return self.vocab_words[best_idx]
-
-
-
+            # On utilise la fonction de recherche du cluster mémoire (FAISS ou GPU Brut)
+            # C'est la même fonction que pour "comprendre", mais utilisée à l'envers
+            # On cherche le vecteur le plus proche dans TOUTE la mémoire
+            # threshold=0.5 pour éviter de dire n'importe quoi
+            matches = self.brain.memory.find_top_k(vector, k=3, threshold=0.45)
+            if not matches:
+                return "???" , 0, 0.0
+            best_word, best_layer, score = matches[0]
+            # Gestion anti-perroquet (si le vecteur est identique à l'entrée)
+            if anti_parrot and score > 0.99 and len(matches) > 1:
+                 best_word = matches[1][0]
+                 best_layer= matches[1][1]
+                 score = matches[1][2]
+            print(f" [ARTICULATE RETURN] word: {best_word} layer: {best_layer} score : {score}")
+            return best_word, best_layer, score
 
 
 
@@ -2086,7 +2408,8 @@ class HybridMemoryCluster:
     # Permet de survivre au 'del self.brain' et au 'optimize_memory_layout'
     _shared_db = None
 
-    def __init__(self, dim, max_nodes=None, ram_limit=None):
+    def __init__(self, dim, max_nodes=None, ram_limit=None, brain = None):
+        self.brain = brain
         self.dim = dim
         self.capacity = max_nodes if max_nodes else CFG.INITIAL_MAX_NODES
         # Si aucune limite n'est donnée, on prend celle de la config globale
@@ -2164,6 +2487,11 @@ class HybridMemoryCluster:
         indices_for_extract = indices_tensor.to(idx_device)
         active_vectors = self.fast_index.index_select(0, indices_for_extract)
 
+
+        # [FIX] On normalise pour que FAISS compare les angles, pas la puissance
+        active_vectors = F.normalize(active_vectors, p=2, dim=1, eps=CFG.EPSILON)
+
+
         # 3. Nourrir FAISS
         if hasattr(self.search_engine, 'reset'): self.search_engine.reset()
         
@@ -2229,17 +2557,31 @@ class HybridMemoryCluster:
         
     # --- AJOUT MVP15 : Gestion des Clés Composites ---
     @staticmethod
-    def _make_key(name, layer):
+    def _make_key(name, layer, boolstring = False):
         """Génère une signature unique pour éviter les collisions Concept/Réalité."""
-        return f"{int(layer)}::{name}"
+        if boolstring:
+            return f"{int(layer)}::{name}"
+        else:
+            return (int(layer), name)
 
     @staticmethod
     def _parse_key(key):
         """Reconstitue les métadonnées depuis la signature."""
-        if "::" in key:
-            parts = key.split("::", 1)
-            return int(parts[0]), parts[1]
-        return 0, key # Fallback pour compatibilité ascendante (Layer 0 par défaut)
+        
+        if isinstance(key,str):
+            if "::" in key:
+                parts = key.split("::", 1)
+                return int(parts[0]), parts[1]
+            return 0, key # Fallback pour compatibilité ascendante (Layer 0 par défaut)
+        else:
+            return key[0], key[1]
+    
+    @classmethod
+    def _convert_key_fromTupleToString(cls,key):
+        if isinstance(key,str):
+            return key
+        else:
+            return cls._make_key(key[1], key[0], boolstring = True)
     
     def resize(self, new_capacity):
         print(f" [MEMORY] Tentative de redimensionnement : {self.capacity} -> {new_capacity}")
@@ -2304,7 +2646,7 @@ class HybridMemoryCluster:
         if phys_table_name in self.db.table_names():
             try:
                 tbl = self.db.open_table(phys_table_name)
-                safe_name = HybridMemoryCluster._make_key(safe_name, layer).replace("'", "''")
+                safe_name = HybridMemoryCluster._make_key(safe_name, layer, boolstring = True).replace("'", "''")
                 
                 # Filtre sur Name ET Layer (Clé composite)
                 
@@ -2324,7 +2666,8 @@ class HybridMemoryCluster:
         
         
         # --- FIX DEBUG : Vérification des Zéros ---
-        if vectors.norm() == 0:
+        #if vectors.norm() == 0:
+        if torch.count_nonzero(vectors) == 0:
             print(f" [WARN MEMORY] Tentative d'écriture de vecteurs NULS pour : {names}")
             traceback.print_stack()
             # On pourrait return ici, mais on laisse passer pour voir l'impact, 
@@ -2341,11 +2684,14 @@ class HybridMemoryCluster:
         # --- BRANCHE CONDITIONNELLE : QUANTIZATION ---
         batch_scales = None
         if self.is_quantized:
+            """
             # Mode INT8 : On compresse avant de stocker
             # vectors est supposé être FP32/FP16 ici
             storage_vectors, batch_scales = SmartQuantizer.quantize(vectors)
             # On s'assure que les scales sont en (N, 1)
             if batch_scales.dim() == 1: batch_scales = batch_scales.unsqueeze(1)
+            """
+            storage_vectors = Quantizer.to_storage(vectors)
         else:
             # Mode FP32 (Standard) : On stocke tel quel
             storage_vectors = Quantizer.to_storage(vectors)
@@ -2354,6 +2700,13 @@ class HybridMemoryCluster:
         # 3. Préparation des données pour le CALCUL (GPU Fast Index)
         # Toujours en haute précision (FP16 ou FP32) pour la physique
         compute_vecs = vectors.to(dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
+        
+        # --- LE PIEGE EST ICI (Entrée) ---
+        #audit_tensor(compute_vecs, f"Ecriture update_batch (Input) pour {names}")
+        # ---------------------------------
+        # --- LE PIEGE EST ICI (Entrée) ---
+        #audit_tensor(vectors, f"Ecriture update_batch (Input) pour {names}")
+        # ---------------------------------
         
         # 4. Boucle d'allocation et d'écriture
         for i, name in enumerate(names):
@@ -2377,12 +2730,16 @@ class HybridMemoryCluster:
             # Indispensable pour save_monolithic et la cohérence INT8
             if self.master_storage.device.type == 'cpu':
                 self.master_storage[idx] = storage_vectors[i].detach().clone().to('cpu')
+                """
                 if self.is_quantized and batch_scales is not None:
                     self.master_scales[idx] = batch_scales[i].detach().clone().to('cpu')
+                """
             else:
                 self.master_storage[idx] = storage_vectors[i]
+                """
                 if self.is_quantized and batch_scales is not None:
                     self.master_scales[idx] = batch_scales[i]
+                """
             
             # D. Marquage LRU et Dirty (Pour sauvegarde différée)
             if key in self.lru_tracker:
@@ -2423,17 +2780,22 @@ class HybridMemoryCluster:
             self._flush_single_to_disk(victim_key, victim_idx)
             self.dirty_set.remove(victim_key)
             
+            
+        layer, name = self._parse_key(victim_key)
+        self.brain.force_node_unload(name, layer)
         del self.name_to_idx[victim_key]
         del self.idx_to_name[victim_idx]
+        
+        
         return victim_idx
         
     def _flush_single_to_disk(self, key, idx):
         """Sauvegarde d'urgence lors d'une éviction."""
         layer, name = self._parse_key(key)
         vec_np = self.fast_index[idx].detach().cpu().numpy()
-        
+        key_db_string = HybridMemoryCluster._make_key(name, layer, boolstring =True)
         # Donnée formatée pour LanceDB
-        data_item = [{"vector": vec_np, "name": name, "layer": str(layer), "id": key}]
+        data_item = [{"vector": vec_np.flatten(), "name": name, "layer": str(layer), "id": key_db_string}]
         
         
         try:
@@ -2441,7 +2803,7 @@ class HybridMemoryCluster:
             if self.table_name in self.db.table_names():
                 tbl = self.db.open_table(self.table_name)
                 # Stratégie Delete-Insert pour éviter les doublons
-                safe_name = key.replace("'", "''")
+                safe_name = key_db_string.replace("'", "''")
                 tbl.delete(f"id = '{safe_name}'")
                 tbl.add(data_item)
             else:
@@ -2462,7 +2824,7 @@ class HybridMemoryCluster:
         
     def ensure_loaded_batch(self, names, layer=0):
         """Prefetch groupé depuis le disque."""
-        missing = [self._make_key(n, layer) for n in names if self._make_key(n, layer) not in self.name_to_idx and self._make_key(n, layer) in self.known_keys_on_disk]
+        missing = [self._make_key(n, layer, boolstring = True) for n in names if self._make_key(n, layer) not in self.name_to_idx and self._make_key(n, layer) in self.known_keys_on_disk]
         if not missing: return
         
         try:
@@ -2474,13 +2836,21 @@ class HybridMemoryCluster:
                 # Requête optimisée
                 df = tbl.search().where(f"id IN ({safe_names})").to_pandas()
                 if not df.empty: self._ingest_dataframe(df)
-        except Exception: pass
+        #except Exception: pass
+        except Exception as e: print(f" [CRASH LOAD BATCH] {e}")
         
     def _ingest_dataframe(self, df):
         """Injecte des données disque en RAM (sans marquer dirty)."""
         # Conversion Vectorisée
         vecs_np = np.stack(df['vector'].values)
         vecs_tensor = torch.from_numpy(vecs_np).to(dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
+        
+        # --- LE PIEGE EST ICI ---
+        #audit_tensor(vecs_tensor, "Chargement _ingest_dataframe (LanceDB -> RAM)")
+        # ------------------------
+        
+        
+        
         names = df['name'].tolist(); layers = df['layer'].tolist()
         
         for i, name in enumerate(names):
@@ -2623,7 +2993,8 @@ class HybridMemoryCluster:
                 tbl = self.db.open_table(self.table_name)
                 
                 # Construction de la requête LanceDB
-                query = tbl.search(query_np)
+                query = tbl.search(query_np.flatten())
+                query.metric("cosine")
                 
                 # --- FILTRE SQL (Predicate Pushdown) ---
                 if layer_set:
@@ -2653,7 +3024,11 @@ class HybridMemoryCluster:
                         # on NE l'écrase PAS, car la version RAM est plus récente.
                         if full_key not in candidates:
                             candidates[full_key] = score
-            except Exception: pass
+                        print(f' [LANCEDB TopK IN]{full_key} {score}')
+                    else:
+                        print(f' [LANCEDB TopK OUT]{full_key} {score}')
+            except Exception as e:
+                print(f" [WARN] Erreur lanceDB Search: {e}")
 
         # --- D. TRI FINAL ET FORMATAGE ---
         # On trie tous les candidats par score décroissant
@@ -2667,17 +3042,169 @@ class HybridMemoryCluster:
             
         return results
         
-    def get_vectors_by_names(self, names):
+    
+        
+    
+    
+    def _fetch_from_lancedb(self, identifiersIN, layer_type=None):
+        """
+        Sous-fonction 1 : Récupère les données depuis LanceDB.
+        Args:
+            identifiers (list): Liste de strings. 
+                                - Si layer_type est None -> Ce sont des clés composites (ex: "0::chat")
+                                - Si layer_type est défini -> Ce sont des noms simples (ex: "chat")
+            layer_type (int, optional): Le filtre de layer. Par défaut None.
+        """
+        
+        if not self.db or not (self.table_name in self.db.table_names()) or not identifiersIN:
+            #print(f"[ERROR NO DB] DB:{self.db} tableName:{self.table_name} tablelist:{self.db.table_names()} IdentfierIN:{identifiersIN}")
+            #traceback.print_stack()
+            return []
+        
+        
+ 
+ 
+        # --- NORMALISATION ---# Si l'utilisateur a donné juste "chat", on transforme en ["chat"]
+        if isinstance(identifiersIN, tuple):
+            identifiers = [identifiersIN]
+        else:
+            identifiers = identifiersIN
+            
+        
+            
+        try:
+            # Nettoyage : On s'assure que les identifiants sont des strings propres pour le SQL
+            # On échappe les apostrophes simples pour éviter les injections SQL basiques
+            sanitized_ids = [f"'{HybridMemoryCluster._convert_key_fromTupleToString(x).replace("'", "''")}'" for x in identifiers]
+            ids_string = ", ".join(sanitized_ids)
+            query = ""
+ 
+            # CAS 1 : Recherche par Clés Composites (ID)
+            if layer_type is None:
+                # On suppose que identifiers contient ["0::chat", "1::chien"]
+                query = f"id IN ({ids_string})"
+ 
+            # CAS 2 : Recherche par Nom + Layer
+            else:
+                # On suppose que identifiers contient ["chat", "chien"] et layer_type=0
+                # On doit filtrer par nom ET par layer
+                # Note : Cela suppose que ta table LanceDB a bien les colonnes 'name' et 'layer_type'
+                query = f"name IN ({ids_string}) AND layer = {int(layer_type)}"
+ 
+            # Exécution
+            tbl = self.db.open_table(self.table_name)
+            records = tbl.search() \
+                .where(query) \
+                .limit(len(identifiers)) \
+                .to_list()
+            #print(f"[DEBUG DB] resultquery:{records}")
+            return records
+        except Exception as e:
+            print(f"[ERROR] LanceDB Fetch ({'Name' if layer_type is not None else 'ID'}): {e}")
+            traceback.print_exc()
+            return []
+    
+    def _integrate_into_memory(self, records):
+        """
+        Sous-fonction 2 : Injecte les vecteurs dans le Tenseur et refait les liens.
+        Retourne un dictionnaire {nom: tensor} des éléments chargés.
+        """
+        loaded_results = {}
+ 
+        for r in records:
+            keyID = r['id']
+            name = r['name']
+            layer = r['layer']
+            key = HybridMemoryCluster._make_key(name, layer)
+            # Conversion en Tenseur PyTorch sur le bon device (GPU/CPU)
+            vec = torch.tensor(r['vector']).to(dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
+            vec = vec.unsqueeze(0)
+            # --- A. Gestion Physique (RAM) ---
+            # 1. On trouve une place (Slot)
+            # Si la clé existait déjà (cas rare de race condition), on garde le slot, sinon on alloue
+            if key in self.name_to_idx:
+                idx = self.name_to_idx[key]
+            else:
+                idx = self._allocate_slot() # Peut déclencher une éviction LRU
+            # 2. Écriture dans le Tenseur Global
+            self.fast_index[idx] = vec
+            # 3. Mise à jour des Mappings
+            self.name_to_idx[key] = idx
+            self.idx_to_name[idx] = key
+            # 4. Protection LRU (On vient de le charger, il est "chaud")
+            if key in self.lru_tracker:
+                self.lru_tracker.move_to_end(key)
+            else:
+                self.lru_tracker[key] = True # Ou tout autre valeur témoin
+            # --- B. Gestion Sémantique (Brain Link) ---
+            # On retrouve le nom lisible
+            loaded_results[name] = vec
+            # [CRUCIAL] On notifie le Brain que ce noeud est de nouveau "Vivant" en RAM.
+            # Cela permet au noeud de mettre à jour ses flags internes si besoin.
+            if self.brain:
+                # On suppose une méthode notify_node_loaded dans le Brain (voir plus bas)
+                # Ou simplement : comme name_to_idx est à jour, le lien est rétabli implicitement
+                # Si tu as besoin d'une action explicite :
+                if hasattr(self.brain, 'notify_memory_load'):
+                    self.brain.notify_memory_load(layer, name)
+ 
+        return loaded_results
+        
+    
+        
+    def get_vectors_by_names(self, names, layer_type=0):
         """Legacy Batch Fetch with Auto-Load."""
-        self.ensure_loaded_batch(names, layer=0)
+        self.ensure_loaded_batch(names, layer=layer_type)
         found_vecs = []
         found_names = []
         for n in names:
-            vec = self.get_vector(n, layer=0)
+            vec = self.get_vector(n, layer=layer_type)
             if vec is not None:
                 found_vecs.append(vec.to(CFG.COMPUTE_DTYPE))
                 found_names.append(n)
         return (torch.stack(found_vecs), found_names) if found_vecs else (None, [])
+    
+    def get_vectors_batch(self, names, layer=0):
+        """
+        Fonction Maître.
+        Retourne:
+          - results: Dict {nom: Tensor} (ceux trouvés en RAM ou Disque)
+          - missing_names: List [nom] (ceux qui n'existent nulle part)
+        """
+        results = {}
+        missing_keys_map = {} # Map key -> original_name pour la suite
+        # 1. SCAN RAM (Rapide)
+        for name in names:
+            key = self._make_key(name, layer)
+            if key in self.name_to_idx:
+                # HIT RAM
+                idx = self.name_to_idx[key]
+                results[name] = self.fast_index[idx]
+                self.lru_tracker.move_to_end(key)
+            else:
+                # MISS RAM -> Candidat Disque
+                missing_keys_map[key] = name
+ 
+        # 2. SCAN DISQUE (Si nécessaire)
+        if missing_keys_map:
+            # A. Exécution Query
+            keys_to_fetch = list(missing_keys_map.keys())
+            records = self._fetch_from_lancedb(keys_to_fetch)
+            # B. Réintégration & Linking
+            if records:
+                disk_results = self._integrate_into_memory(records)
+                results.update(disk_results)
+        # 3. BILAN
+        # Ceux qui manquent sont ceux qu'on a cherchés sur disque (missing_keys_map)
+        # mais qui ne sont PAS dans les résultats finaux.
+
+        missing_names = [
+            name for name in names 
+            if name not in results
+        ]
+ 
+        return results, missing_names
+    
 
     def get_all_loaded_tensors(self):
         """
@@ -2761,10 +3288,10 @@ class HybridMemoryCluster:
         for key in self.dirty_set:
             if key in self.name_to_idx:
                 idx = self.name_to_idx[key]
-                id_key = key
                 lay, nm = self._parse_key(key)
+                id_key = HybridMemoryCluster._make_key(nm, lay, boolstring =True)
                 vec = self.fast_index[idx].detach().cpu().numpy()
-                data.append({"vector": vec, "name": nm, "layer": str(lay), "id": id_key})
+                data.append({"vector": vec.flatten(), "name": nm, "layer": str(lay), "id": id_key})
                 keys_done.append(key)
         
         if data:
@@ -2797,7 +3324,8 @@ class HybridMemoryCluster:
                     print(f" [MEMORY] Préchauffage : {len(df)} vecteurs.")
                     self._ingest_dataframe(df)
                     self.active_count = len(self.name_to_idx)
-        except Exception: pass
+        #except Exception: pass
+        except Exception as e: print(f" [CRASH LOAD] {e}")
         
         
         
@@ -2815,7 +3343,8 @@ class MatrixEncoder(nn.Module):
     def __init__(self, dim_size, brain):
         super().__init__()
         self.brain = brain; self.dim = dim_size
-        self.semantic_map = {}; self.stats = CognitiveStats(); self.locked_words = set()
+        #self.semantic_map = {}
+        self.stats = CognitiveStats(); self.locked_words = set()
         
         if TOKENIZERS_AVAILABLE:
             self.tokenizer = Tokenizer(models.BPE())
@@ -2871,35 +3400,42 @@ class MatrixEncoder(nn.Module):
         
         return F.normalize(encoded_vec, p=2, dim=0, eps=CFG.EPSILON)
 
-    def encode_word(self, text, layer_type=0):
-        self.stats.usage[text.lower()] += 1
+    def encode_word(self, text, layer_type=0, AddCount=True, use_cache = True, boolQuantizer = True):
+        
         key_concept = HybridMemoryCluster._make_key(text, layer_type)
         
-        if key_concept in self.semantic_map:
-            stored = self.semantic_map[key_concept]
-            #print(f'key_concept recoreded: {key_concept} vector: {stored}')
-            return Quantizer.from_storage(stored)
+        if use_cache:
+                stored = self.brain.memory.get_vector(text, layer=layer_type)
+                if stored is not None:
+                    if AddCount:
+                        self.stats.usage[text.lower()] += 1
+                    
+                    if boolQuantizer:
+                        stored = Quantizer.from_storage(stored)
+                    return stored
             
-        if not TOKENIZERS_AVAILABLE: 
-            return self._encode_legacy(text)
+        if not TOKENIZERS_AVAILABLE:
+            if AddCount:
+                self.stats.usage[text.lower()] += 1
+            vec = self._encode_legacy(text, layer_type=layer_type)
+            self.brain.memory.update_batch([text], torch.stack([vec]), layers=[layer_type])
+            #self.semantic_map[key_concept] = vec.to(dtype=CFG.COMPUTE_DTYPE)
+            if boolQuantizer:
+                vec = Quantizer.from_storage(vec)
+            return vec
             
-        encoding = self.tokenizer.encode(text)
-        ids = torch.tensor(encoding.ids, device=CFG.DEVICE)
-        vec = self._generate_basis_from_ids(ids)
-        w = self.stats.get_inverse_freq_weight(text.lower())
-        final_vec = vec * w 
-        # --- CORRECTIF BUG "BODY" ---
-        # Avant : self.semantic_map[text] = Quantizer.to_storage(final_vec)
-        # Problème : En INT8, to_storage détruit les petites valeurs -> Vecteur Nul -> Body
         
-        # Solution : On garde le cache de l'encodeur en Haute Précision (COMPUTE_DTYPE)
-        # Cela évite le zéro, et c'est cohérent car semantic_map est un cache "chaud".
-        #print(f'[record] index09 {key_concept} ')
-        #traceback.print_stack()
-        self.semantic_map[key_concept] = final_vec.to(dtype=CFG.COMPUTE_DTYPE)
-        # ----------------------------
-        #print(f'key_concept: {key_concept} vector: {self.semantic_map[key_concept]}')
-        return final_vec
+        
+        vecs, weights = self.encode_batch_fast([text], layer_type=layer_type, AddCount=AddCount, use_cache = use_cache)
+        
+        
+        
+        vec = vecs[0]
+        if boolQuantizer:
+            vec = Quantizer.from_storage(vec)
+        
+        
+        return vec
     
     
         
@@ -2922,59 +3458,118 @@ class MatrixEncoder(nn.Module):
         
         return pe
 
-    def encode_batch_fast(self, text_list, layer_type=0):
+    def encode_batch_fast(self, text_list, layer_type=0, AddCount=True, use_cache = True):
         """
         Version PRO : Vectorisation totale + Encodage Standard.
         Compatible CPU/GPU, haute performance, mathématiquement robuste.
         """
-        self.stats.usage.update([t.lower() for t in text_list])
+        if AddCount:
+            self.stats.usage.update([t.lower() for t in text_list])
             
-        if not TOKENIZERS_AVAILABLE:
-            return torch.stack([self.encode_word(t, layer_type) for t in text_list])
-            
-        encodings = self.tokenizer.encode_batch(text_list)
-        
-        # 1. Padding Vectorisé (Batch Rectangulaire)
-        max_len = max(len(e.ids) for e in encodings)
-        if max_len == 0: return torch.zeros((len(text_list), self.dim), device=CFG.DEVICE)
-        
         batch_size = len(text_list)
-        padded_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=CFG.DEVICE)
+    
+        # 2. Pré-allocation sur GPU (Destination finale)
+        final_tensor = torch.zeros((batch_size, self.dim), device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
+        # Listes logistiques pour gérer les manques
+        indices_missing = []
+        raw_vectors_found = []
+        indices_found = []
+        results, texts_missing = self.brain.memory.get_vectors_batch(text_list, layer=layer_type)
         
-        # Remplissage rapide
-        for i, e in enumerate(encodings):
-            if len(e.ids) > 0:
-                padded_ids[i, :len(e.ids)] = torch.tensor(e.ids, device=CFG.DEVICE)
+        # 3. Passe Rapide : Tri Cache vs Calcul ⚡
+        for i, txt in enumerate(text_list):
+            # Si le cache est activé et que le mot est connu
+            if txt in results:
+                # HIT : On récupère depuis la RAM et on envoie au GPU
+                raw_vectors_found.append(results[txt])
+                indices_found.append(i)
+                #final_tensor[i] = Quantizer.from_storage(results[txt])
+                #print(f'[DEBUG get vectorDB] layer:{layer_type} name:{txt} {results[txt]}')
+            else:
+                # MISS : On marque pour calcul
+                indices_missing.append(i)
+                #texts_missing.append(txt)
         
-        # [OPTI2] TRANSFERT ASYNCHRONE VERS LE GPU
-        padded_ids_gpu = padded_ids.to(CFG.DEVICE, non_blocking=True)
-
-        # Projection (Sur GPU)
-        # 2. Projection Sémantique (Lookup)
-        # [Batch, MaxLen, Dim]
-        vectors = self.projection[padded_ids_gpu % self.projection.shape[0]]
+        if raw_vectors_found:
+            batch_raw = torch.stack(raw_vectors_found)
+            batch_float = Quantizer.from_storage(batch_raw) # BOOM ! Rapide.
+            
+            # Assignation en masse (Scatter) ou boucle simple sur des floats déjà prêts
+            final_tensor[indices_found] = batch_float
         
         
-        # 3. Encodage Positionnel "Standard" (Le remplacement des nombres magiques)
-        # On génère la matrice de position [MaxLen, Dim]
-        pos_encoding = self._get_sinusoidal_encoding(max_len, self.dim, CFG.DEVICE)
+        # 4. Le Calcul "Chirurgical" (Uniquement sur les manquants) 🏥
+        if texts_missing:
+            # Fallback de sécurité si le tokenizer n'est pas chargé
+            if not TOKENIZERS_AVAILABLE:
+                # On utilise la méthode unitaire lente mais sûre
+                batch_missing = torch.stack([self.encode_word(t, layer_type=layer_type, AddCount=False, use_cache = use_cache, boolQuantizer = False) for t in texts_missing])
+            else:
+                # A. Tokenization Batch
+                encodings = self.tokenizer.encode_batch(texts_missing)
+                
+                # B. Gestion du Padding
+                max_len = max((len(e.ids) for e in encodings), default=0)
+                
+                if max_len == 0: 
+                    # Cas rare : liste de chaînes vides
+                    batch_missing = torch.zeros((len(texts_missing), self.dim), device=CFG.DEVICE)
+                else:
+                    # Création du tenseur d'IDs (Batch Rectangulaire)
+                    padded_ids = torch.zeros((len(texts_missing), max_len), dtype=torch.long, device=CFG.DEVICE)
+                    
+                    # Remplissage des IDs
+                    for i, e in enumerate(encodings):
+                        if len(e.ids) > 0:
+                            padded_ids[i, :len(e.ids)] = torch.tensor(e.ids, device=CFG.DEVICE)
+                    # --- CŒUR DU CALCUL (Réplique exacte de encode_words) ---
+                    
+                    # 1. Projection Sémantique
+                    # [Batch, MaxLen, Dim]
+                    vectors = self.projection[padded_ids % self.projection.shape[0]]
+                    
+                    # 2. Encodage Positionnel
+                    # [MaxLen, Dim] -> [1, MaxLen, Dim] (Broadcast)
+                    pos_encoding = self._get_sinusoidal_encoding(max_len, self.dim, CFG.DEVICE).unsqueeze(0)
+                    
+                    # 3. Masque de Padding
+                    # [Batch, MaxLen, 1] - 1 si c'est un mot, 0 si c'est du padding
+                    # C'est vital pour ne pas sommer des zéros qui faussent la moyenne
+                    mask = (padded_ids != 0).unsqueeze(-1).float()
+                    
+                    # 4. Combinaison (Binding)
+                    # CRUCIAL : On utilise la MULTIPLICATION (*) comme dans encode_words
+                    # C'est ce qui donne la robustesse morphologique ("Manger" vs "Mangeons")
+                    # L'addition (+) "floute" le signal. La multiplication (*) "sculpte" le signal.
+                    vectors_scrambled = vectors * pos_encoding
+                    
+                    # 5. Application du Masque (Nettoyage du bruit)
+                    vectors_scrambled = vectors_scrambled * mask
+                    
+                    # 6. Somme (Superposition)
+                    # On écrase tout sur l'axe de la séquence (dim=1)
+                    encoded_vecs = torch.sum(vectors_scrambled, dim=1)
+                    
+                    # 7. Normalisation
+                    batch_missing = F.normalize(encoded_vecs, p=2, dim=1, eps=CFG.EPSILON)        
+        # --- FIN DU BLOC DE CALCUL INTÉGRÉ ---
+ 
+        # 5. Dispersion (Scatter) et Mise en Cache
+        for idx_compute, idx_original in enumerate(indices_missing):
+            vec = batch_missing[idx_compute]
+            
+            # A. On remplit le trou dans le batch final
+            final_tensor[idx_original] = vec
+            
+            # B. On sauvegarde dans le Cache (Si activé)
+            # On stocke sur CPU (.detach().cpu()) pour ne pas saturer la VRAM avec le dictionnaire
+            
+            
+        if len(indices_missing) > 0:
+            if use_cache:
+                layer_type_list = np.full(len(texts_missing), layer_type)
+                self.brain.memory.update_batch(texts_missing, batch_missing, layers=layer_type_list)
         
-        # On l'étend pour le batch : [1, MaxLen, Dim] -> broadcast sur [Batch, MaxLen, Dim]
-        pos_encoding = pos_encoding.unsqueeze(0)
-        
-        # 4. Masquage du Padding
-        # On ne veut pas que les '0' ajoutés influencent le vecteur final
-        mask = (padded_ids_gpu != 0).unsqueeze(-1).float()
-        
-        # 5. Combinaison & Scrambling
-        # Dans la théorie VSA (Vector Symbolic Architecture), la multiplication (Hadamard product)
-        # est souvent utilisée pour lier le "Rôle" (Position) à la "Valeur" (Mot).
-        # Standard Transformer = Addition, mais votre architecture VSA préfère la Multiplication pour le binding.
-        # On garde la multiplication pour la cohérence de votre modèle.
-        vectors_scrambled = vectors * pos_encoding * mask
-        
-        # 6. Somme (Agrégation)
-        encoded_vecs = torch.sum(vectors_scrambled, dim=1)
         
         # 7. Normalisation & Pondération IDF
         # Calcul des poids IDF (Importance du mot)
@@ -2986,12 +3581,9 @@ class MatrixEncoder(nn.Module):
         weights_gpu = weights.to(CFG.DEVICE, non_blocking=True)
         
         
-        # Application aux vecteurs
-        final_vecs = F.normalize(encoded_vecs, p=2, dim=1, eps=CFG.EPSILON) * weights_gpu
-        
         # MODIFICATION : On retourne aussi les poids bruts !
         # Ils serviront de "Masse de base" pour la physique.
-        return final_vecs, weights_gpu.squeeze(1)
+        return final_tensor, weights_gpu.squeeze(1)
 
     
 
@@ -2999,29 +3591,27 @@ class MatrixEncoder(nn.Module):
         b_text = text.encode('latin-1', errors='replace')
         indices = torch.tensor(list(b_text), device=CFG.DEVICE)
         vec = self._generate_basis_from_ids(indices)
-        return vec * self.stats.get_weight(text.lower())
+        return vec
 
     def bind_syntax(self, vector, position_index): return torch.roll(vector, shifts=position_index, dims=0)
     
-    def get_semantic_vector(self, text, layer=0):
+    def get_semantic_vector(self, text, layer=0,boolQuantizer = True):
         
-        key_concept = HybridMemoryCluster._make_key(text, layer)
+        #key_concept = HybridMemoryCluster._make_key(text, layer)
         # 1. Priorité à la mémoire vive (Hot Memory - GPU/Fast Index)
         # C'est là que les modifications vectorisées (learn_attraction_batch) sont appliquées.
-        if hasattr(self.brain, 'memory') and key_concept in self.brain.memory.name_to_idx:
-            idx = self.brain.memory.name_to_idx[key_concept]
-            # On récupère le vecteur frais directement depuis l'index
-            vec = self.brain.memory.fast_index[idx]
-            # On le convertit en float32 (COMPUTE_DTYPE) pour les calculs
-            return vec.to(dtype=CFG.COMPUTE_DTYPE)
-
-        # 2. Fallback sur le cache dictionnaire (Cold Storage)
-        # Utilisé pour les mots qui ne sont pas encore indexés dans le cluster mémoire
-        key_concept = HybridMemoryCluster._make_key(text, layer)
-        if key_concept not in self.semantic_map: 
-            self.encode_word(text, layer) 
         
-        return Quantizer.from_storage(self.semantic_map[key_concept])
+        vectorSearch = self.brain.memory.get_vector(text, layer)
+        
+        if vectorSearch is None:
+            # 2. Fallback sur le cache dictionnaire (Cold Storage)
+            # Utilisé pour les mots qui ne sont pas encore indexés dans le cluster mémoire
+            vectorSearch = self.encode_word(text, layer,boolQuantizer = False)
+        
+        if boolQuantizer:
+            vectorSearch = Quantizer.from_storage(vectorSearch)
+        
+        return vectorSearch
 
     def learn_attraction(self, wa, wb, force=0.1, layer_type_wa=0, layer_type_wb=0):
         f = force * self.brain.temperature; va = self.get_semantic_vector(wa, layer_type_wa); vb = self.get_semantic_vector(wb, layer_type_wb); tgt = F.normalize(va+vb, p=2, dim=0, eps=CFG.EPSILON)
@@ -3031,7 +3621,7 @@ class MatrixEncoder(nn.Module):
             new_va = F.normalize(va + ma + ra, p=2, dim=0, eps=CFG.EPSILON)
             key_concept = HybridMemoryCluster._make_key(wa, layer_type_wa)
             #print(f'[record] index08 {key_concept} ')
-            self.semantic_map[key_concept] = Quantizer.to_storage(new_va)
+            #self.semantic_map[key_concept] = Quantizer.to_storage(new_va)
             # --- FIX : On injecte le NOUVEAU vecteur directement ---
             self.brain.memory.update(wa, new_va, layer_type_wa) 
             # -------------------------------------------------------
@@ -3041,7 +3631,7 @@ class MatrixEncoder(nn.Module):
             new_vb = F.normalize(vb + mb + rb, p=2, dim=0, eps=CFG.EPSILON)
             key_concept = HybridMemoryCluster._make_key(wb, layer_type_wb)
             #print(f'[record] index07 {key_concept} ')
-            self.semantic_map[key_concept] = Quantizer.to_storage(new_vb)
+            #self.semantic_map[key_concept] = Quantizer.to_storage(new_vb)
             # --- FIX : On injecte le NOUVEAU vecteur directement ---
             self.brain.memory.update(wb, new_vb, layer_type_wb)
             # -------------------------------------------------------
@@ -3140,7 +3730,7 @@ class MatrixEncoder(nn.Module):
         
         key_concept = HybridMemoryCluster._make_key(wa, layer_type_wa)
         #print(f'[record] index06 {key_concept} ')
-        self.semantic_map[key_concept] = new_va.to(dtype=CFG.COMPUTE_DTYPE)
+        #self.semantic_map[key_concept] = new_va.to(dtype=CFG.COMPUTE_DTYPE)
         
         # 2. Mise à jour mémoire centrale (On passe new_va, pas self.get_semantic_vector(wa))
         self.brain.memory.update(wa, new_va, layer_type_wa)
@@ -3218,6 +3808,7 @@ class FractalNode(nn.Module):
         'is_dirty', 
         '_plasticity',  # Attention : c'est _plasticity (la propriété wrapper)
         'mass', 
+        'nature', 
         '_nature_vec'
     ]
     # ----------------------------------------
@@ -3232,7 +3823,8 @@ class FractalNode(nn.Module):
         self.parent = parent; self.children = {}; self.concepts = []; self.states = {}; self.metadata = {}
         self.brain = None
         self.layer_type = layer_type if layer_type is not None else CFG.LAYER_CONCEPT
-        self.percepts = [] 
+        self.percepts = []
+        self.nature = nature
         
         layer_type_nature = CFG.LAYER_CONCEPT
         if self.encoder: self.brain = self.encoder.brain
@@ -3270,16 +3862,25 @@ class FractalNode(nn.Module):
         
         if not is_loaded:
             if self.encoder:
-                self.nature_vec = self.encoder.encode_word(nature, self.layer_type)
+                #self.nature_vec = self.encoder.encode_word(self.nature, self.layer_type)
+                self.nature_vec = self.encoder.encode_word(self.name, self.layer_type, boolQuantizer = False)
             else:
                 self.nature_vec = torch.randn(dim).to(CFG.DEVICE)
-        
-        
         
         #self.sync_to_memory()
         self._load()
         
-
+    
+    def unload_vector(self):
+        """
+        Force le nœud à relâcher sa référence au tenseur lourd.
+        Appelé par le système de gestion de mémoire lors d'une éviction LRU.
+        """
+        # On coupe la référence. Le Garbage Collector fera le reste.
+        self._nature_vec = None
+        # Optionnel : On peut mettre un flag pour dire "je suis déchargé"
+        is_loaded = False
+    
     @property
     def nature_vec(self):
         if self.brain and hasattr(self.brain, 'memory') and self.brain.memory:
@@ -3290,14 +3891,26 @@ class FractalNode(nn.Module):
                 target = CFG.DEVICE if 'CFG' in globals() else 'cpu'
                 if vec.device != target: vec = vec.to(target)
                 self._nature_vec = vec
-        return self._nature_vec
+        
+        
+        returnValue = self._nature_vec
+        
+        try:
+            if returnValue is not None:
+                returnValue = Quantizer.from_storage(returnValue)
+        except Exception as e:
+            print(f" [ERR QUANTIZER] {e}")
+                
+        #return Quantizer.from_storage(self._nature_vec)
+        return returnValue
 
     @nature_vec.setter
     def nature_vec(self, vector):
         """
         Setter intelligent : Dès qu'on modifie le vecteur, on met à jour la mémoire.
         """
-        self._nature_vec = vector
+        vector_for_record = Quantizer.to_storage(vector)
+        self._nature_vec = vector_for_record
         
         # Si on a une mémoire et un vecteur valide, on sauvegarde immédiatement
         if vector is not None:
@@ -3374,9 +3987,9 @@ class FractalNode(nn.Module):
                 self.brain.encoder.learn_attraction(self.name, percept_node.name, force=1.0, layer_type_wa=self.layer_type, layer_type_wb=percept_node.layer_type)
     
     
-    def _make_key(self):
+    def _make_key(self, boolstring = False):
         """Génère une signature unique pour éviter les collisions Concept/Réalité."""
-        return HybridMemoryCluster._make_key(self.name, self.layer_type)
+        return HybridMemoryCluster._make_key(self.name, self.layer_type, boolstring)
     
     def sync_to_memory(self):
         """Force la mise à jour de la mémoire centrale pour ce noeud."""
@@ -3422,7 +4035,7 @@ class FractalNode(nn.Module):
         # MODIFICATION : On bypass le stockage INT8 pour les propriétés locales
         # pour éviter l'effacement des données fines.
         # On utilise COMPUTE_DTYPE (FP16/32) au lieu de STORAGE_DTYPE
-        self.states[d] = v.to(dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
+        self.states[d] = Quantizer.from_storage(v.to(dtype=CFG.COMPUTE_DTYPE))
         self.mark_dirty()
     def mark_dirty(self, visited=None): 
         # Protection anti-récursion cyclique
@@ -3661,7 +4274,10 @@ class OpSynthesis(SemanticOperator):
         # Enregistrement global si concept
         if layer_type == CFG.LAYER_CONCEPT:
              #print(f'[record] index05 {key_concept} ')
-             brain.encoder.semantic_map[key_concept] = res_vec
+             #brain.encoder.semantic_map[key_concept] = res_vec
+             # --- FIX : On injecte le NOUVEAU vecteur directement ---
+             brain.memory.update(new_name, res_vec, layer_type)
+             # -------------------------------------------------------
              
         new_node.absorb("valeur", res_vec, force=trust_level)
         print(f" [HARDWARE] {node_subj.name} + {node_target.name} -> {new_name}")
@@ -3684,9 +4300,12 @@ class OpContext(SemanticOperator):
         res_vec = F.normalize(sem_a * sem_b, p=2, dim=0, eps=CFG.EPSILON)
         
         if layer_type == CFG.LAYER_CONCEPT:
-            res_name_key = HybridMemoryCluster._make_key(res_name, layer_type)
+            #res_name_key = HybridMemoryCluster._make_key(res_name, layer_type)
             #print(f'[record] index04 {res_name_key} ')
-            brain.encoder.semantic_map[res_name_key] = res_vec
+            #brain.encoder.semantic_map[res_name_key] = res_vec
+            # --- FIX : On injecte le NOUVEAU vecteur directement ---
+            brain.memory.update(res_name, res_vec, layer_type)
+            # -------------------------------------------------------
              
         new_node.absorb("valeur", res_vec, force=trust_level)
         print(f" [HARDWARE] {node_subj.name} * {node_target.name} = {res_name}")
@@ -3705,7 +4324,11 @@ class OpLabel(SemanticOperator):
         if trust_level > 0.8:
             # Mise à jour globale de l'encodeur pour le futur
             #print(f'[record] index03 {node_target._make_key()} ')
-            brain.encoder.semantic_map[node_target._make_key()] = node_subj.nature_vec
+            #brain.encoder.semantic_map[node_target._make_key()] = node_subj.nature_vec
+            # --- FIX : On injecte le NOUVEAU vecteur directement ---
+            vec = node_subj.nature_vec
+            self.memory.update(node_subj.name, vec, node_subj.layer)
+            # -------------------------------------------------------
             
             # Mise à jour locale
             node_target.absorb("valeur", node_subj.nature_vec, force=1.0)
@@ -3763,7 +4386,7 @@ class GenesisBridge(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
-    def process_data(self, raw_data, SensoryStreamObj = None):
+    def process_data(self, raw_data, SensoryStreamObj = None, layer_type=CFG.LAYER_CONCEPT, mode="REALITY", trust=1.0):
         raise NotImplementedError
 
     def run(self):
@@ -3771,11 +4394,11 @@ class GenesisBridge(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 raw_data = self.in_q.get(timeout=CFG.INGESTION_TIMEOUT)
-                if raw_data == "__SYNC_MARKER__":
+                if raw_data["PKGE"] == "__SYNC_MARKER__":
                     self.out_q.put({"type": "MARKER"})
                     continue
                 
-                result = self.process_data(raw_data)
+                result = self.process_data(raw_data["PKGE"], layer_type=raw_data["layer"], mode=raw_data["mode"], trust=raw_data["trust"])
                 # Note: process_data peut gérer l'envoi lui-même
                     
             except queue.Empty:
@@ -3791,7 +4414,7 @@ class TextIngestionBridge(GenesisBridge):
     2. DÉTACHÉ (Heavy Bridge) : Utilise un tokenizer local pour préparer les paquets.
     """
     def __init__(self, name, brain=None):
-        super().__init__(name, brain)
+        super().__init__(name, brain = brain)
         self.local_tokenizer = None
         
     def setup_headless(self):
@@ -3808,7 +4431,7 @@ class TextIngestionBridge(GenesisBridge):
         except ImportError:
             self.local_tokenizer = None
 
-    def process_cpu_batch(self, raw_lines):
+    def process_cpu_batch(self, raw_lines, boolHeavy = False, ListCounts= None, layer_type=CFG.LAYER_CONCEPT, mode="REALITY", trust=1.0):
         """
         [FONCTION COEUR] Logique pure CPU partagée (Light & Heavy).
         Nettoie, Découpe (Split) et Tronçonne (Chunking) le texte.
@@ -3817,14 +4440,12 @@ class TextIngestionBridge(GenesisBridge):
         # On récupère la limite de taille (Défaut 128 si pas de config)
         max_len = CFG.MAX_SEQUENCE_LENGTH if hasattr(builtins, 'CFG') else 128
         
-        for line in raw_lines:
+        for enum, line in enumerate(raw_lines):
             # 1. Nettoyage et split phrases (Premier niveau)
             sentences = line.replace(".", " .").split(" .")
-            
             for sent in sentences:
                 txt = sent.strip()
                 if not txt: continue
-                
                 # 2. Découpage en Mots (Niveau Sémantique)
                 all_words = txt.split()
                 if not all_words: continue
@@ -3848,35 +4469,47 @@ class TextIngestionBridge(GenesisBridge):
 
                     local_counts = Counter(chunk_words)
                     
+                    if boolHeavy:
+                        if ListCounts is not None:
+                            local_counts = ListCounts[enum]
+                            
+
                     # Structure standardisée
                     item = {
                         "ids": token_ids,
                         "tokens": chunk_words, # Paquet sûr (<= 128 mots)
                         "counts": local_counts,
-                        "raw_text": " ".join(chunk_words)
+                        "raw_text": " ".join(chunk_words),
+                        "layer": layer_type,
+                        "mode": mode,
+                        "trust": trust
                     }
                     processed_items.append(item)
                 
         return processed_items
 
-    def process_data(self, text_batch, SensoryStreamObj = None):
+    def process_data(self, text_batch, SensoryStreamObj = None, layer_type=CFG.LAYER_CONCEPT, mode="REALITY", trust=1.0):
         """Point d'entrée pour le Light Bridge (Thread)."""
         # 1. Préparation CPU (Réutilisation de la logique coeur)
-        items = self.process_cpu_batch(text_batch)
+        items = self.process_cpu_batch(text_batch, layer_type=layer_type, mode=mode, trust=trust)
         
         # 2. Finalisation GPU (Spécifique Light Bridge)
         if self.brain:
             for item in items:
                 # En mode Light, on vectorise tout de suite
-                vecs, weights = self.brain.encoder.encode_batch_fast(item["tokens"])
+                vecs, weights = self.brain.encoder.encode_batch_fast(item["tokens"], layer_type=item["layer"])
                 
                 packet = {
                     "type": "TEXT_BATCH",
                     "vecs": vecs,
                     "weights": weights,
                     "tokens": item["tokens"],
-                    "count": len(vecs)
+                    "count": len(vecs),
+                    "layer": item["layer"],
+                    "mode": item["mode"],
+                    "trust": item["trust"]
                 }
+                
                 
                 if SensoryStreamObj is None:
                     self.out_q.put(packet)
@@ -3890,7 +4523,7 @@ class TextIngestionHeavyBridge(GenesisBridge):
     Gère les processus et transmet les paquets SÉQUENTIELLEMENT au GPU.
     """
     def __init__(self, name, brain):
-        super().__init__(name, brain)
+        super().__init__(name, brain = brain)
         ctx = multiprocessing.get_context('spawn')
         self.heavy_in_q = ctx.Queue(maxsize=CFG.HEAVY_QUEUE_SIZE)
         self.heavy_out_q = ctx.Queue(maxsize=CFG.HEAVY_QUEUE_SIZE)
@@ -3905,6 +4538,7 @@ class TextIngestionHeavyBridge(GenesisBridge):
         for i in range(CFG.HEAVY_WORKERS_COUNT):
             # On passe la config pour que le worker connaisse MAX_SEQUENCE_LENGTH
             config_snapshot = {"MAX_SEQUENCE_LENGTH": CFG.MAX_SEQUENCE_LENGTH}
+            #w = HeavyIngestionWorker(i, self.heavy_in_q, self.heavy_out_q, config_snapshot, brain = self.brain)
             w = HeavyIngestionWorker(i, self.heavy_in_q, self.heavy_out_q, config_snapshot)
             w.start()
             self.workers.append(w)
@@ -3959,8 +4593,9 @@ class TextIngestionHeavyBridge(GenesisBridge):
                         for item in packet["data"]:
                             tokens = item["tokens"]
                             if not tokens: continue
-                            if "counts" in item: self.brain.encoder.stats.usage.update(item["counts"])
-                            vecs, weights = self.brain.encoder.encode_batch_fast(tokens)
+                            
+                            vecs, weights = self.brain.encoder.encode_batch_fast(tokens, AddCount=False, layer_type=item["layer"])
+                            #vecs, weights = self.brain.encoder.encode_batch_fast(tokens)
                             final_packet = {"type": "TEXT_BATCH", "vecs": vecs, "weights": weights, "tokens": tokens, "count": len(vecs)}
                             self.out_q.put(final_packet)
             except queue.Empty: pass
@@ -3974,7 +4609,7 @@ class TextIngestionHeavyBridge(GenesisBridge):
             if self.markers_to_inject_count > 0:
                 try:
                     # On essaie d'injecter un marqueur
-                    self.heavy_in_q.put("__SYNC_MARKER__", timeout=0.005)
+                    self.heavy_in_q.put({"PKGE":"__SYNC_MARKER__"}, timeout=0.005)
                     # Si succès, on décrémente
                     self.markers_to_inject_count -= 1
                 except queue.Full:
@@ -3993,12 +4628,29 @@ class TextIngestionHeavyBridge(GenesisBridge):
                 try:
                     raw_data = self.in_q.get_nowait()
                     
-                    if raw_data == "__SYNC_MARKER__":
+                    if raw_data["PKGE"] == "__SYNC_MARKER__":
                         # DÉTECTION DU FLUSH : On arme la séquence d'injection
                         self.pending_markers_to_receive = len(self.workers) # On attend N réponses
                         self.markers_to_inject_count = len(self.workers)    # On doit envoyer N requêtes
                         # On ne stocke pas le marqueur dans current_stuck_item, c'est géré par le compteur
                     else:
+                        if raw_data is not None:
+                            templistCount = []
+                            #print(f'[CCOTESTO] {raw_data}')
+                            for itemlist in raw_data["PKGE"]:
+                                all_words = itemlist.split()
+                                tempCounter = Counter([t.lower() for t in all_words])
+                                #print(f'[CCOTESTO] {itemlist}')
+                                #print(f'[CCOTESTO] {tempCounter}')
+                                #print(f'[CCOTESTO] {self.brain.encoder.stats.usage}')
+                                self.brain.encoder.stats.usage.update(tempCounter)
+                                #print(f'[CCOTESTO] {self.brain.encoder.stats.usage}')
+                                for k in tempCounter:
+                                    tempCounter[k] = self.brain.encoder.stats.usage[k]
+                                #print(f'[CCOTESTO] {tempCounter}')
+                                templistCount.append(tempCounter)
+                                
+                            raw_data["counts"] = templistCount
                         current_stuck_item = raw_data
                 except queue.Empty: pass
 
@@ -4059,8 +4711,9 @@ class HeavyIngestionWorker(multiprocessing.Process):
     """
     [HEAVY SHELL] Coquille vide qui exécute le Logic Core dans un processus isolé.
     """
-    def __init__(self, worker_id, input_queue, output_queue, config_dict):
+    def __init__(self, worker_id, input_queue, output_queue, config_dict, brain=None):
         super().__init__(name=f"HeavyWorker_{worker_id}")
+        self.brain = brain
         self.worker_id = worker_id
         self.in_q = input_queue
         self.out_q = output_queue
@@ -4074,7 +4727,8 @@ class HeavyIngestionWorker(multiprocessing.Process):
     def run(self):
         # 1. Instanciation du Cœur Logique (Mode Détaché / Headless)
         # On crée le bridge sans Brain (brain=None), juste pour sa méthode process_cpu_batch
-        core_processor = TextIngestionBridge(name=f"Core_{self.worker_id}", brain=None)
+        #core_processor = TextIngestionBridge(name=f"Core_{self.worker_id}", brain=self.brain)
+        core_processor = TextIngestionBridge(name=f"Core_{self.worker_id}", brain=self.brain)
         
         # On charge les outils locaux (Tokenizer) si dispo
         core_processor.setup_headless()
@@ -4086,15 +4740,17 @@ class HeavyIngestionWorker(multiprocessing.Process):
                 # A. Réception
                 raw_batch = self.in_q.get(timeout=0.5)
                 
-                if raw_batch == "__SYNC_MARKER__":
+                if raw_batch["PKGE"] == "__SYNC_MARKER__":
                     self.out_q.put({"type": "MARKER", "worker_id": self.worker_id})
                     continue
                 
                 # B. Délégation (Le point clé !)
                 # Le Worker n'a plus aucune idée de comment on découpe une phrase.
                 # Il demande juste au "Logic Core" de le faire.
-                processed_items = core_processor.process_cpu_batch(raw_batch)
-                
+                #print(raw_batch["PKGE"])
+                #print(raw_batch["counts"])
+                processed_items = core_processor.process_cpu_batch(raw_batch["PKGE"],boolHeavy=True, ListCounts=raw_batch["counts"], layer_type=raw_batch["layer"], mode=raw_batch["mode"], trust=raw_batch["trust"])
+                #print(processed_items)
                 # C. Envoi
                 if processed_items:
                     # Conversion au format de transport (sérialisable)
@@ -4105,11 +4761,14 @@ class HeavyIngestionWorker(multiprocessing.Process):
                             "ids": item["ids"],
                             "tokens": item["tokens"],
                             "counts": item["counts"],
-                            "raw_text": item["raw_text"]
+                            "raw_text": item["raw_text"],
+                            "layer": item["layer"],
+                            "mode": item["mode"],
+                            "trust": item["trust"]
                         })
                         
                     payload = {"type": "BATCH_RESULT", "data": batch_data}
-                    
+                    #print(payload)
                     if ORJSON_AVAILABLE:
                         # [OPTI ORJSON] Sérialisation binaire ultra-rapide
                         try:
@@ -4164,8 +4823,7 @@ class SensoryStream:
         else:
             print(" [WARN] Multithreading désactivé. Le bridge ne démarrera pas.")
 
-    def UpdateUniversalPhysicsContext(self,physicProfileName=CFG.DEFAULT_FIELD):
-        self.phys_engine.UpdateUniversalPhysicsContext(physicProfileName)
+    
 
 
     def stop(self):
@@ -4187,17 +4845,17 @@ class SensoryStream:
         if self.bridge:
             
             # 1. On envoie les données
-            self.bridge.in_q.put(token_list_raw)
+            self.bridge.in_q.put({"PKGE" : token_list_raw, "layer": layer_type, "mode": mode, "trust":trust})
             
             # 2. Si on doit attendre (Test/Training), on envoie le marqueur de fin
             if sync_wait:
-                self.bridge.in_q.put("__SYNC_MARKER__")
+                self.bridge.in_q.put({"PKGE":"__SYNC_MARKER__"})
                 
                 # 3. Boucle d'attente active (Token Passing)
                 # On consomme tout ce qui arrive jusqu'à retrouver notre marqueur
                 while True:
                     try:
-                        packet = self.bridge.out_q.get(timeout=10.0)
+                        packet = self.bridge.out_q.get(timeout=20.0)
                         
                         if packet["type"] == "MARKER":
                             break # C'est fini, on rend la main
@@ -4212,7 +4870,7 @@ class SensoryStream:
         # --- CAS 2 : SÉQUENTIEL (Fallback) ---
         else:
             #print("[DEBUG]: monothread")
-            result = self.seq_processor.process_data(token_list_raw, SensoryStreamObj = self)
+            result = self.seq_processor.process_data(token_list_raw, SensoryStreamObj = self, layer_type=layer_type, mode=mode, trust=trust)
             #processed_items = self.seq_processor.process_cpu_batch(raw_lines)
             #self._process_sequential_legacy(token_list_raw)
             
@@ -4239,7 +4897,7 @@ class SensoryStream:
         #print(" [STREAM] Flush Sync (Sentinel Pattern)...")
         
         # 1. On injecte le marqueur de fin dans le tuyau
-        self.bridge.in_q.put("__SYNC_MARKER__")
+        self.bridge.in_q.put({"PKGE": "__SYNC_MARKER__"})
         
         # 2. On consomme tout jusqu'à retrouver le marqueur
         while True:
@@ -4285,6 +4943,7 @@ class SensoryStream:
         """Exécute la physique sur un paquet pré-calculé (GPU Only)."""
         vecs = packet["vecs"]
         weights = packet["weights"]
+        layer_type = packet["layer"]
         words = packet["tokens"]
         n = packet["count"]
         #print("oooooooooooooooooooooooooooooooooo")
@@ -4304,154 +4963,77 @@ class SensoryStream:
         self.active_count = n
         self.vecs_buffer[:n] = vecs
         self.weights_buffer[:n] = weights
+        self.word_tokens[:n] = words
         
-		############################
-		########   CCOTEST BEGIN
-		############################
-        # --- CORRECTION CRITIQUE (Fix Parsing) ---
-        # On remet une position linéaire (Sequence Index) pour que la grammaire
-        # comprenne la notion de "proche dans la phrase".
-        # On crée des vecteurs [0,0...], [1,0...], [2,0...] pour être compatible 4096D
-        ### CCOIMPLEMPOS seq_pos = torch.arange(n, device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE).unsqueeze(1)
-        # On remplit le buffer (NxD) avec des zéros, puis on met l'index dans la dim 0
-        ### CCOIMPLEMPOS self.positions_buffer[:n].fill_(0.0) 
-        ### CCOIMPLEMPOS self.positions_buffer[:n, 0:1] = seq_pos
-        # -----------------------------------------
-		############################
-		########   CCOTEST END
-		############################
+        #self.positions_buffer[:n] = vecs[:, :CFG.SPATIAL_DIM] # Default: Projection
+        # A. On prépare les vecteurs par défaut (Projection Sémantique)
+        # Si le concept est nouveau, Position = Sens, Vitesse = 0
+        
+        # --- FIX DIMENSIONNEL AUTO-ADAPTATIF ---
+        # Permet de projeter une sémantique Low-Res (64) dans un Espace Hi-Res (128)
+        # ou l'inverse, sans crash.
+        
+        # 1. Reset complet préalable (Plus rapide que de padder manuellement des bouts)
+        # Optionnel si tu es sûr que le buffer est propre, mais recommandé pour éviter les fantômes
+        # self.positions_buffer[:n].zero_() 
+
+        # 2. On détermine la zone de recouvrement
+        width = min(vecs.shape[1], CFG.SPATIAL_DIM)
+        
+        # 3. Copie Sémantique -> Physique
+        self.positions_buffer[:n, :width] = vecs[:, :width]
+        
+        # 4. Si la sémantique est plus petite que l'espace physique (ex: 64 < 128)
+        # On s'assure que le reste est à zéro (Neutre)
+        if CFG.SPATIAL_DIM > width:
+            self.positions_buffer[:n, width:] = 0.0
+            
+        # 5. Init Vitesse
+        self.velocities_buffer[:n].zero_() # Default: Immobile
+        
         
         # CORRECTION : La position initiale est le vecteur sémantique lui-même
         # self.positions_buffer[:n] = vecs #=====> CCOTEST a voir si impact
         # Mise à jour des tokens pour la logique sémantique
-        # (Attention: ceci est lent en Python pur, point d'opti futur)
-        for i, w in enumerate(words):
-             if i < self.MAX_LEN: self.word_tokens[i] = w
-
-        # 3. REHYDRATATION PHYSIQUE (Le chaînon manquant)
-        # On va chercher où sont ces concepts MAINTENANT dans le cerveau
         
-        # A. On prépare les vecteurs par défaut (Projection Sémantique)
-        # Si le concept est nouveau, Position = Sens, Vitesse = 0
-        self.positions_buffer[:n] = vecs[:, :CFG.SPATIAL_DIM] # Default: Projection
-        self.velocities_buffer[:n].zero_() # Default: Immobile
         
-        # B. On écrase avec la réalité (Mémoire Hot)
-        # Note : On pourrait vectoriser ça avec une map "Word -> UID" optimisée,
-        # mais pour l'instant la boucle est sûre et rapide pour N=128.
-        
-        # On récupère le layer cible actuel (contexte)
-        target_layer = self.layer_type if hasattr(self, 'layer_type') else CFG.LAYER_CONCEPT
-        
-        for i, word in enumerate(words):
-            if i >= n: break
-            
-            # On cherche si le noeud existe DÉJÀ
-            node = self.brain.find_node_in_layer(word, target_layer)
-            
-            if node:
-                uid = node.uid
-                # Lecture directe dans les tenseurs globaux du cerveau
-                # C'est ici qu'on récupère la continuité du mouvement !
-                self.positions_buffer[i] = self.brain.memory_positions[uid]
-                self.velocities_buffer[i] = self.brain.memory_velocities[uid]
-                
-                # Mise à jour du buffer de layer pour les masques
-                self.layer_buffer[i] = node.layer_type
-            else:
-                # Nouveau noeud (sera créé dans _process_buffer_vectorized ou via ensure)
-                self.layer_buffer[i] = target_layer
-
-
         # Mise à jour mémoire (Learning)
-        self.brain.memory.update_batch(words, vecs)
+        
+        layer_type_array = np.full(len(words), layer_type)
+        self.brain.memory.update_batch(words, vecs, layers=layer_type_array)
         
         # Physique
-        self._process_buffer_vectorized()
+        self._process_buffer_vectorized(self.brain.pipelineList["PipelineHardCodedText"])
         
         # Reset
         self.active_count = 0
 
-
-    def _generate_attention_mask(self, n):
-        mask = torch.ones((n, n), device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
-        return mask
-        
-    def _generate_topk_mask_vectorized(self, vecs, n):
+    def _process_buffer_vectorized(self, pipelineObj):
         """
-        Génère un masque d'attention clairsemé (Sparse) en pur Tensoriel.
-        Compatible CPU/GPU sans aucune boucle Python.
+        Pipeline principal orchestrant la physique sémantique et la logique.
+        Refactorisé pour modularité et performance.
         """
-        # 1. Calcul préliminaire de similarité (brut)
-        # On normalise pour que le Top-K soit basé sur la sémantique pure (Cosinus)
-        # et non la masse.
-        vecs_norm = F.normalize(vecs[:n], p=2, dim=1, eps=CFG.EPSILON)
-        sim_matrix = torch.mm(vecs_norm, vecs_norm.t())
-        
-        # 2. Sélection des K meilleurs voisins (Vectorisé via CUDA/AVX)
-        # k doit être borné par n (on ne peut pas chercher 10 voisins s'il n'y a que 5 objets)
-        k_safe = min(CFG.TOP_K_LIMIT, n)
-        
-        # torch.topk retourne les valeurs et les indices. On ne veut que les indices.
-        _, indices = torch.topk(sim_matrix, k=k_safe, dim=1)
-        
-        # 3. Création du Masque (Scatter Method - Zéro boucle)
-        mask = torch.zeros_like(sim_matrix)
-        
-        # On "disperse" des 1.0 aux endroits indiqués par les indices du Top-K
-        # src=1.0 est broadcasté
-        mask.scatter_(1, indices, 1.0)
-        
-        # Optionnel : On s'assure que la diagonale est active ou inactive selon besoin
-        # Pour la gravité, on évite l'auto-attraction, le kernel gère déjà la diagonale 0
-        # mais c'est plus propre de laisser le mask propre.
-        
-        return mask
-
-    def _get_interaction_mask(self, n, layer_target_type):
-        """
-        Génère un masque tensoriel basé sur les règles de config (PHYSICS_RULES).
-        Gère le mapping dynamique des layers profonds (2000 -> REALITY).
-        """
-        current_types = self.layer_buffer[:n]
-        
-        # 1. Mapping du Layer demandé vers la Règle de Config
-        rule_key = layer_target_type
-        if layer_target_type >= CFG.DEPTH_REALITY:
-            rule_key = CFG.LAYER_REALITY # = 2000
-        elif layer_target_type < CFG.DEPTH_BUFFER:
-            rule_key = CFG.LAYER_CONCEPT # = 0
- 
-        # 2. Récupération de la règle
-        if rule_key not in CFG.PHYSICS_RULES:
-            # Fallback : si pas de règle, on isole tout (pas d'interaction)
-            return torch.zeros((n, n), device=CFG.DEVICE)
-            
-        rule_targets = CFG.PHYSICS_RULES[rule_key]
-        
-        # 3. Construction du Masque Vectorisé
-        # On regarde pour chaque item si son type est autorisé dans la liste 'sources'
-        # Note: Dans PHYSICS_RULES, la liste définit QUI peut interagir avec le layer cible
-        allowed_tensor = torch.tensor(rule_targets, device=CFG.DEVICE)
-        
-        # Masque [N, 1] : Est-ce que l'élément i est compatible ?
-        # On utilise le broadcasting pour vérifier l'appartenance
-        is_compatible = (current_types.unsqueeze(1) == allowed_tensor).any(dim=1).float()
-        
-        # Le masque final est une matrice (N, N) : interaction active si les deux sont compatibles
-        return torch.mm(is_compatible.unsqueeze(1), is_compatible.unsqueeze(0))
-
-
-
-    def _process_buffer_vectorized(self):
         n = self.active_count
         if n < 2: return
+ 
+        # ÉTAPE 1 : HYDRATATION (Scan & Vector Prep)
+        # Récupère les données brutes et prépare les tenseurs (Slices)
+        # ctx est un dictionnaire contenant tout l'état du batch (pointeurs)
+        ctx = self._hydrate_batch_entities(n)
+ 
+        pipelineObj._process_buffer_vectorized_pipeline(ctx)
+        
+        
+    def _hydrate_batch_entities(self, n):
+        """
+        [SCAN MOTIF]
+        Prépare les entités : Récupère positions, vitesses, masses et opérateurs.
+        Retourne un contexte (ctx) léger contenant les vues (slices).
+        """
         
         # 1. SLICING PUR (On garde ça car c'est sain pour la propreté du signal)
-        vecs_slice = self.vecs_buffer[:n]
-        pos_slice = self.positions_buffer[:n]
-        vel_slice = self.velocities_buffer[:n]
         current_words = self.word_tokens[:n]
+        
         
         # --- [PURGE] ON VIRE SPARSE PHYSICS ---
         # On analyse la phrase brute, sans biais externe.
@@ -4475,12 +5057,26 @@ class SensoryStream:
         self.masses_buffer[:n] = self.weights_buffer[:n] * gravity_factor
         effective_trust = getattr(self, 'current_trust_level', 1.0)
         
+        # 3. REHYDRATATION PHYSIQUE (Le chaînon manquant)
+        # On va chercher où sont ces concepts MAINTENANT dans le cerveau
+        
+        # B. On écrase avec la réalité (Mémoire Hot)
+        # Note : On pourrait vectoriser ça avec une map "Word -> UID" optimisée,
+        # mais pour l'instant la boucle est sûre et rapide pour N=128.
+        
+        current_words_node = []
         for i, token in enumerate(current_words):
             # Population Logique (Création des Nodes si absents)
             c = self.brain.ensure_node_in_layer(token, target_layer_base)
             if c:
+                current_words_node.append(c)
+                uid = c.uid
                 self.layer_buffer[i] = c.layer_type
-                self.uid_buffer[i] = c.uid
+                self.uid_buffer[i] = uid
+                # Lecture directe dans les tenseurs globaux du cerveau
+                # C'est ici qu'on récupère la continuité du mouvement !
+                self.positions_buffer[i] = self.brain.memory_positions[uid]
+                self.velocities_buffer[i] = self.brain.memory_velocities[uid]
                 if (hardware := c.get_hardware_function()):
                     ops[i] = hardware
                     # L'opérateur écrase la masse sémantique (Priorité absolue)
@@ -4488,415 +5084,32 @@ class SensoryStream:
                     op_dirs[i] = c.metadata.get("op_dir", "<>")
             else:
                 self.layer_buffer[i] = target_layer_base
-
-        mass_slice = self.masses_buffer[:n]
+    
+    
         
-        # 3. MASQUES & CALCUL PHYSIQUE
-        # On utilise le Top-K Vectorisé pour l'attention physique
-        attention_mask = self._generate_topk_mask_vectorized(vecs_slice, n)
+        # Slices (Vues directes sur le buffer, zéro copie)
+        ctx = {
+            "n": n,
+            "words": current_words,
+            "vecs": self.vecs_buffer[:n],
+            "pos": self.positions_buffer[:n],
+            "vel": self.velocities_buffer[:n],
+            "mass": self.masses_buffer[:n], # Sera rempli ici
+            "uids": self.uid_buffer[:n],
+            "layers": self.layer_buffer[:n],
+            "ops": ops,      # Liste Python rapide pour les objets Op
+            "op_dirs": op_dirs,  # Directions SVO
+            "nodes": current_words_node,            # Cache des objets Node
+            "gravity": gravity_factor,
+            "target_layer": target_layer_base,
+            "effective_trust" : effective_trust,
+            "list_command_text" : []
+        }
         
-        # Masque Logique (Règles Layer)
-        layer_mask = self._get_interaction_mask(n, target_layer_base)
-        final_mask = attention_mask * layer_mask
-        
-        if CFG.USE_CUDA: torch.cuda.synchronize()
-        
-        # APPEL ENGINE (Sur les Slices)
-        # Note: raw_force_matrix est [N, N] (Matrice d'énergie)
-        raw_force_matrix, raw_force_mouvement = self.phys_engine.compute(pos_slice, mass_slice, vecs_slice, n, vel_slice, mask=final_mask)
-        
-        if CFG.USE_CUDA: torch.cuda.synchronize()
-        
-        # 4. POST-TRAITEMENT (Legacy Logic)
-        # Gravité Relative
-        raw_force_matrix = raw_force_matrix * gravity_factor
-        if raw_force_matrix.is_sparse: raw_force_matrix = raw_force_matrix.to_dense()
-
-        # LE POINT CRITIQUE : On définit masked_forces
-        # C'est cette matrice qui contient la vérité physique (Masse * Sim * Gravité)
-        masked_forces = raw_force_matrix 
-        
-        # --- [REACTIVATION] INTEGRATION EULER (Mouvement) ---
-        # C'est ici que les concepts bougent physiquement !
-        force_vectors = raw_force_mouvement * gravity_factor
-        
-        
-        dt = 1.0 # Pas de temps
-        FRICTION = 0.90 # Amortissement pour éviter que ça explose (90% de conservation)
-        
-        # 1. Calcul Accélération (a = F / m)
-        # On sécurise la masse pour éviter la division par zéro
-        safe_mass = torch.clamp(mass_slice.unsqueeze(1), min=0.01)
-        acceleration = force_vectors / safe_mass
-        
-        # 2. Mise à jour Vitesse (v = v*friction + a*dt)
-        vel_slice.mul_(FRICTION).add_(acceleration * dt)
-        
-        # 3. Mise à jour Position (p = p + v*dt)
-        pos_slice.add_(vel_slice * dt)
-        
-        # 4. COMMIT : Enregistrement dans le Cerveau
-        # C'est CRUCIAL. Si on ne fait pas ça, le mouvement reste dans le buffer temporaire
-        # et n'est jamais sauvegardé dans LanceDB ou Safetensors.
-        
-        # On utilise le mapping inverse (word -> uid) stocké dans layer_buffer ou via lookup
-        # Comme 'current_words' est aligné avec 'pos_slice', on peut itérer.
-        # Pour aller VITE, on suppose que les indices du buffer correspondent aux positions chargées.
-        # Mais pour être 100% sûr, on refait un lookup rapide.
-        """
-        for i, word in enumerate(current_words):
-            # On récupère le noeud (le buffer layer_buffer contient le bon layer type)
-            layer = self.layer_buffer[i].item()
-            node = self.brain.find_node_in_layer(word, layer)
-            
-            if node:
-                # Écriture dans la mémoire globale (Persistance)
-                self.brain.memory_positions[node.uid] = pos_slice[i]
-                self.brain.memory_velocities[node.uid] = vel_slice[i]
-        """
-        # A. On récupère les IDs concernés
-        # active_uids doit être un LongTensor sur le même Device que la mémoire
-        active_uids = self.uid_buffer[:n]
-        
-        # B. Écriture de masse des POSITIONS (1 seule commande)
-        # "Prends les valeurs de pos_slice et mets-les aux indices active_uids"
-        #self.brain.memory_positions.index_copy_(0, active_uids, pos_slice.to(torch.float16))
-        self.brain.memory_positions.index_copy_(0, active_uids, pos_slice)
-        
-        
-        # C. Écriture de masse des VÉLOCITÉS (1 seule commande)
-        # C'est la ligne que tu as justement réclamée !
-        #self.brain.memory_velocities.index_copy_(0, active_uids, vel_slice.to(torch.float16))
-        self.brain.memory_velocities.index_copy_(0, active_uids, vel_slice)
-        
-        # ----------------------------------------------------
-
-        # 5. PARSING LOGIQUE (SVO) - RETOUR À LA LOGIQUE LEGACY
-        base_threshold = 0.001
-        force_threshold = max(base_threshold * gravity_factor, 1e-6)
-        mass_threshold = CFG.MASS_THRESHOLD * gravity_factor
-
-        # Détection des Agents Actifs
-        max_forces = masked_forces.max(dim=1).values
-        is_operator_mask = (mass_slice >= (CFG.MASS_OPERATOR - 1.0))
-        has_strong_interaction = (max_forces > force_threshold)
-        
-        active_agents_mask = is_operator_mask & has_strong_interaction
-        active_indices = torch.nonzero(active_agents_mask, as_tuple=False).squeeze(1).cpu().numpy()
-        
-        if len(active_indices) == 0: return
-
-        indices = torch.arange(n, device=CFG.DEVICE)
-        
-        # --- CORRECTION MAJEURE : On utilise masked_forces (Physique) pour le Top-K ---
-        # C'est ça qui manquait. On ne recalcule pas sim_analysis.
-        # On regarde : "Où la force est-elle la plus forte ?"
-        
-        forces_past = masked_forces * (indices.unsqueeze(1) > indices.unsqueeze(0))   # Influence venant d'avant (j < i)
-        forces_future = masked_forces * (indices.unsqueeze(1) < indices.unsqueeze(0)) # Influence venant d'après (j > i)
-        
-        # On prend les indices des forces MAXIMALES
-        k_val = min(3, n)
-        top_past_ind = torch.topk(forces_past, k=k_val, dim=1).indices.cpu().numpy()
-        top_future_ind = torch.topk(forces_future, k=k_val, dim=1).indices.cpu().numpy()
-        
-        # 6. BOUCLE D'EXECUTION (Le Cerveau)
-        for i in active_indices:
-            op = ops[i]
-            if not op: continue
-            
-            # Recherche Cible (Dans le futur) basé sur la FORCE PHYSIQUE
-            targ_idx = -1
-            for k in range(k_val):
-                c_idx = top_future_ind[i, k]
-                # On vérifie si la force brute dépasse le seuil
-                if masked_forces[i, c_idx].item() > force_threshold:
-                    if mass_slice[c_idx] > mass_threshold:
-                        targ_idx = c_idx; break
-            
-            # Recherche Sujet (Dans le passé) basé sur la FORCE PHYSIQUE
-            subj_idx = -1
-            for k in range(k_val):
-                c_idx = top_past_ind[i, k]
-                if masked_forces[i, c_idx].item() > force_threshold:
-                    if mass_slice[c_idx] > mass_threshold:
-                        subj_idx = c_idx; break
-            
-            if subj_idx != -1 and targ_idx != -1:
-                subj_name = current_words[subj_idx]
-                target_name = current_words[targ_idx]
-                
-                d = op_dirs[i]
-                if d == "><": subj_name, target_name = target_name, subj_name
-                
-                # Execution
-                node_s = self.brain.ensure_node_in_layer(subj_name, target_layer_base)
-                node_t = self.brain.ensure_node_in_layer(target_name, target_layer_base)
-                
-                try:
-                    op.execute(self.brain, node_s, node_t, layer_type=target_layer_base, trust_level=effective_trust)
-                except Exception as e:
-                    print(f" [EXEC ERR] {e}")
-
-
-    def _process_buffer_vectorized_new(self):
-        n = self.active_count
-        if n < 2: return
-        
-        vecs_slice = self.vecs_buffer[:n]
-        pos_slice = self.positions_buffer[:n]
-        vel_slice = self.velocities_buffer[:n]
-        current_words = self.word_tokens[:n]
-        
-        # --- [INTEGRATION SPARSE PHYSICS] ---
-        # C'est ici le point d'injection idéal.
-        # On modifie 'vecs_slice' pour qu'il contienne l'influence du passé.
-        # Le reste de la fonction utilisera cette version enrichie.
-        if CFG.ENABLE_SPARSE_PHYSICS and hasattr(self, 'sparse_engine'):
-             vecs_slice = self.sparse_engine.apply_context_pressure(vecs_slice, current_words)
-        # ------------------------------------
-        
-        
-        
-        ops = [None] * n
-        op_dirs = [None] * n
-        
-        # 1. Détermination du Layer Cible (Contexte)
-        target_layer_base = CFG.DEPTH_CONCEPT
-        if hasattr(self, 'current_context_mode') and self.current_context_mode == "REALITY":
-             target_layer_base = CFG.DEPTH_REALITY
-        
-        # Récupération du Facteur G (Scalabilité)
-        # Fallback si on utilise les IDs profonds non mappés directement
-        if target_layer_base >= CFG.DEPTH_REALITY:
-            gravity_factor = CFG.GRAVITY_MAPPING[CFG.LAYER_REALITY] # 0.2
-        else:
-            # On map 2000 -> 0.2, 0 -> 1.0
-            gravity_factor = CFG.GRAVITY_MAPPING.get(target_layer_base, CFG.GRAVITY_MAPPING["DEFAULT"])
-        # 2. CALCUL MATRICIEL DE LA MASSE (L'idée du siècle)
-        # Masse = Poids Sémantique * Gravité du Monde
-        # Plus de boucle Python pour ça ! C'est instantané sur GPU.
-        self.masses_buffer[:n] = self.weights_buffer[:n] * gravity_factor
-        
-        effective_trust = getattr(self, 'current_trust_level', 1.0)
-        
-        # 2. Préparation des Agents (Masses & Ops)
-        for i, token in enumerate(current_words):
-            base_mass = vecs_slice[i].norm().item()
-            #self.masses_buffer[i] = base_mass
-            
-            # --- CORRECTION : On utilise ensure_node_in_layer pour peupler la scène ---
-            # Si le mot est nouveau dans ce contexte (ex: "Cloche" en Réalité), il est créé.
-            # Cela garantit qu'il a un ID, une masse et une plasticité.
-            c = self.brain.ensure_node_in_layer(token, target_layer_base)
-            if c:
-                self.layer_buffer[i] = c.layer_type
-                if (hardware := c.get_hardware_function()):
-                    ops[i] = hardware
-                    self.masses_buffer[i] = CFG.MASS_OPERATOR * hardware.priority
-                    op_dirs[i] = c.metadata.get("op_dir", "<>")
-                
-            
-            # PLUS DE CALCUL DE MASSE DANS CETTE BOUCLE
-            # C'est déjà fait vectoriellement au-dessus.
-            # Le code est nettoyé de toute logique "hasattr(mass)".
-            
-            # On peuple juste le layer buffer pour le masque d'interaction
-            # Si l'objet n'est pas encore créé, on assume le layer cible
-            self.layer_buffer[i] = target_layer_base
-        mass_slice = self.masses_buffer[:n]
-        
-        # 3. Calcul Physique Brut (Toutes interactions possibles)
-        # On utilise un masque simple ici (tout le monde voit tout le monde), le filtrage se fait après
-        #attention_mask = self._generate_attention_mask(n)
-        # --- MODIFICATION : ATTENTION SÉLECTIVE (TOP-K) ---
-        # Au lieu de : attention_mask = self._generate_attention_mask(n)
-        attention_mask = self._generate_topk_mask_vectorized(vecs_slice, n)
-        # Masque B : Qui a le droit d'interagir ? (Règles Layer)
-        # On détermine le layer cible comme avant
-        target_layer_base = CFG.DEPTH_CONCEPT
-        if hasattr(self, 'current_context_mode') and self.current_context_mode == "REALITY":
-             target_layer_base = CFG.DEPTH_REALITY
-             
-        layer_mask = self._get_interaction_mask(n, target_layer_base)
-        # On les fusionne : Physique (TopK) AND Logique (Layer Rules)
-        # Le moteur recevra un seul masque qui contient toutes les contraintes
-        final_mask = attention_mask * layer_mask
-        
-        
-        if CFG.USE_CUDA: torch.cuda.synchronize()
-        raw_force_matrix, raw_force_movement = self.phys_engine.compute(pos_slice, mass_slice, vecs_slice, n, vel_slice, mask=final_mask)
-        if CFG.USE_CUDA: torch.cuda.synchronize()
-        
-        # 5. TEST DE VÉRITÉ
-        #print(f"DEBUG: Shape raw_force_matrix = {raw_force_matrix.shape}")
-        #if 'layer_mask' in locals():
-        #     print(f"DEBUG: Shape layer_mask = {layer_mask.shape}")
-        
-        
-        
-        # Application de la Gravité Relative (Terre vs Mars)
-        # C'est ici que la magie opère : on atténue tout le layer d'un coup.
-        # 4. Application de la Gravité Relative
-        # On récupère le facteur G
-        if target_layer_base >= CFG.DEPTH_REALITY:
-            gravity_factor = CFG.GRAVITY_MAPPING[CFG.LAYER_REALITY]
-        else:
-            gravity_factor = CFG.GRAVITY_MAPPING.get(target_layer_base, CFG.GRAVITY_MAPPING["DEFAULT"])
-            
-        raw_force_matrix = raw_force_matrix * gravity_factor
-        
-        if raw_force_matrix.is_sparse:
-             raw_force_matrix = raw_force_matrix.to_dense()
-        
-        # 5. PAS DE FILTRAGE POST-CALCUL (Suppression de la ligne qui plantait)
-        # masked_forces = raw_force_matrix * layer_mask  <-- SUPPRIMÉ
-        masked_forces = raw_force_matrix
-        #print(f"DEBUG: Shape masked_forces = {masked_forces.shape}")
-        
-        
-        # =================================================================
-        # [NOUVEAU] INTEGRATION DU MOUVEMENT (EULER SEMI-IMPLICITE)
-        # C'est ici qu'on applique les forces pour mettre à jour positions/vitesses
-        # et qu'on renvoie le résultat au Cerveau.
-        # =================================================================
-        
-        dt = 1.0 # Delta Time (1 step)
-        
-        # F = m * a  =>  a = F / m
-        # On évite division par zéro avec clamp
-        safe_mass = torch.clamp(mass_slice.unsqueeze(1), min=0.01)
-        acceleration = masked_forces / safe_mass
-        
-        # Mise à jour Vitesse (v = v + a*dt)
-        # On applique aussi une friction naturelle (0.95) pour éviter l'explosion
-        vel_slice.mul_(0.95).add_(acceleration * dt)
-        
-        # Mise à jour Position (p = p + v*dt)
-        pos_slice.add_(vel_slice * dt)
-        
-        # CRUCIAL : RENVOI VERS LE CERVEAU (Commit)
-        # On doit réécrire les nouvelles valeurs dans la mémoire globale
-        # Sinon le mouvement est perdu au prochain tour !
-        for i, word in enumerate(current_words):
-            node = self.brain.find_node_in_layer(word, self.layer_buffer[i].item())
-            if node:
-                self.brain.memory_positions[node.uid] = pos_slice[i]
-                self.brain.memory_velocities[node.uid] = vel_slice[i]
-        
-        # ================================================================
-        
-        
-        
-        # 5. Analyse des Forces (Trigger)
-        # CORRECTION : Le seuil doit s'adapter à la gravité du Layer.
-        # Si G=0.2 (Réalité), le seuil doit baisser pour détecter les interactions.
-        # Sinon, tout est filtré comme "bruit".
-        base_threshold = 0.001
-        force_threshold = base_threshold * gravity_factor
-        mass_threshold = CFG.MASS_THRESHOLD * gravity_factor
-        
-        # Pour éviter un seuil à 0 si gravity_factor est nul (peu probable mais prudent)
-        force_threshold = max(force_threshold, 1e-6)
-
-        
-        max_forces = masked_forces.max(dim=1).values
-        
-        is_operator_mask = (mass_slice >= (CFG.MASS_OPERATOR - 1.0))
-        has_strong_interaction = (max_forces > force_threshold)
-        
-        active_agents_mask = is_operator_mask & has_strong_interaction
-        active_indices = torch.nonzero(active_agents_mask, as_tuple=False).squeeze(1).cpu().numpy()
-        
-        
-        if len(active_indices) == 0: return
  
-        indices = torch.arange(n, device=CFG.DEVICE)
-        # SVO : Sujet (Passé) < Opérateur (Présent) < Cible (Futur)
-        # 1. On recrée les Matrices d'Influence [N, N]
-        # 1. Calcul rapide de l'intensité relationnelle [N, N]
-        # (On normalise pour avoir une valeur propre entre 0 et 1)
-        v_norm = F.normalize(vecs_slice, p=2, dim=1)
-        sim_analysis = torch.mm(v_norm, v_norm.t()) # Matrice [4, 4]
+        return ctx
 
-        # 2. Définition des Masques Temporels [N, N]
-        mask_past = (indices.unsqueeze(1) > indices.unsqueeze(0))   # Influence venant d'avant
-        mask_future = (indices.unsqueeze(1) < indices.unsqueeze(0)) # Influence venant d'après
-        
-        # 3. Calcul des Totaux (Scalaires)
-        # On remplace l'ancienne logique vectorielle par une somme d'intensité sémantique.
-        # Les variables 'total_past' et 'total_future' existent et sont valides pour la suite.
-        total_past = (sim_analysis * mask_past).sum(dim=1)
-        total_future = (sim_analysis * mask_future).sum(dim=1)
-        
-        # (On supprime les lignes forces_past = ... qui causaient le crash)
-        # =================================================================
-
-        # Le reste de ton code original fonctionne maintenant car total_past existe !
-        limit_force = 0.1 # Seuil arbitraire (ajuste si besoin)
-        
-        
-        # Ce sont les "cartes" des interactions temporelles
-        matrix_past = sim_analysis * mask_past
-        matrix_future = sim_analysis * mask_future
-        
-        # 2. Calcul des Top-K (Qui m'a le plus influencé ?)
-        # On cherche les indices des noeuds avec la plus forte intensité
-        # C'est exactement l'équivalent de tes anciennes lignes, mais sur la matrice stable.
-        
-        # Protection contre n < k (si on a moins de 3 mots)
-        k_val = min(3, n)
-        
-        top_past_ind = torch.topk(matrix_past, k=k_val, dim=1).indices.cpu().numpy()
-        top_future_ind = torch.topk(matrix_future, k=k_val, dim=1).indices.cpu().numpy()
-        
-        for i in active_indices:
-            op = ops[i]
-            if not op: continue
-            
-            # Recherche Cible (Futur)
-            targ_idx = -1
-            for k in range(min(3, n)):
-                c_idx = top_future_ind[i, k]
-                if masked_forces[i, c_idx].item() > force_threshold:
-                    # Filtre anti-poussière
-                    if mass_slice[c_idx] > mass_threshold:
-                        targ_idx = c_idx; break
-            
-            # Recherche Sujet (Passé)
-            subj_idx = -1
-            for k in range(min(3, n)):
-                c_idx = top_past_ind[i, k]
-                if masked_forces[i, c_idx].item() > force_threshold:
-                    if mass_slice[c_idx] > mass_threshold:
-                        subj_idx = c_idx; break
-            
-            
-                
-            if subj_idx != -1 and targ_idx != -1:
-                subj_name = current_words[subj_idx]
-                target_name = current_words[targ_idx]
-                
-                
-                
-                d = op_dirs[i]
-                if d == "><":
-                    subj_name, target_name = target_name, subj_name
-                
-                # --- IMPLEMENTATION DE VOTRE OPTIMISATION ---
-                # On récupère/crée les objets Node AVANT l'appel
-                # Cela garantit que les masses et plasticités sont réglées par la factory centrale
-                node_s = self.brain.ensure_node_in_layer(subj_name, target_layer_base)
-                node_t = self.brain.ensure_node_in_layer(target_name, target_layer_base)
-                
-                try:
-                    # On passe les OBJETS, pas les NOMS
-                    
-                    op.execute(self.brain, node_s, node_t, layer_type=target_layer_base,
-                               trust_level=effective_trust)
-                except Exception as e:
-                    print(f" [EXEC ERR] {e} {op}")
-                    traceback.print_exc()
+    
 
 class UnifiedBrain:
     def __init__(self, str_lang, boolResetBase=False, ram_limit=None):
@@ -4911,7 +5124,7 @@ class UnifiedBrain:
         self.spatial_dim = getattr(CFG, "SPATIAL_DIM", 128) # Sécurité si pas dans config
         self.encoder = MatrixEncoder(self.dim, self).to(CFG.DEVICE) 
         self.phys = HyperPhysics(self.dim).to(CFG.DEVICE)
-        self.memory = HybridMemoryCluster(self.dim, max_nodes=CFG.INITIAL_MAX_NODES, ram_limit=self.ram_limit)
+        self.memory = HybridMemoryCluster(self.dim, max_nodes=CFG.INITIAL_MAX_NODES, ram_limit=self.ram_limit, brain=self)
         
         # --- FIX INTEGRATION ---
         # C'est la ligne qui manquait et causait la régression
@@ -4922,6 +5135,15 @@ class UnifiedBrain:
         
         self.associative_memory = AssociativeMemory(self); self.broca = self.associative_memory 
         self.stream = SensoryStream(self); self.metabolism = CognitiveMetabolism(self); self.chronos = Chronos(self.dim) 
+        # [NOUVEAU] Initialisation Physique & Outils
+        self.pipelineList = {"PipelineHardCodedText": PipelineSemantic(name="PipelineText", brain=self)}
+        # [NOUVEAU] Initialisation Physique & Outils
+        #self.physics_context = UniversalPhysicsContext()
+        #self.grammar_pipeline = GrammarPipeline(force_th=CFG.MASS_THRESHOLD, mass_th=CFG.MASS_THRESHOLD)
+        #self.tools = [self.grammar_pipeline]
+        # -----------------------------------
+        # -----------------------------------
+        
         self.tool_factory = ToolFactory(self)
         
         self.boredom_level = 0.0
@@ -4943,11 +5165,7 @@ class UnifiedBrain:
         self.snapshot_positions = torch.zeros((self.max_nodes, self.spatial_dim), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         
         
-        # [NOUVEAU] Initialisation Physique & Outils
-        self.physics_context = UniversalPhysicsContext()
-        self.grammar_pipeline = GrammarPipeline(force_th=CFG.MASS_THRESHOLD, mass_th=CFG.MASS_THRESHOLD)
-        self.tools = [self.grammar_pipeline]
-        # -----------------------------------
+        
         
         
         
@@ -5075,6 +5293,18 @@ class UnifiedBrain:
             if node.uid not in self.fuzzy_lookup[key_fuzzy]:
                 self.fuzzy_lookup[key_fuzzy].append(node.uid)
 
+
+    def force_node_unload(self, name, layer_type=0):
+        """
+        Méthode appelée directement par HybridMemoryCluster quand la RAM est pleine.
+        Le Brain agit comme un Manager qui donne l'ordre à ses employés (Nodes).
+        """
+        nodeUnloaded = self.find_node_in_layer(name,layer_type)
+        # On vérifie si le nœud est instancié en mémoire objet Python
+        if nodeUnloaded is not None:
+            # On appelle la méthode de déchargement du FractalNode
+            nodeUnloaded.unload_vector()
+            # print(f"[RAM] Déchargement forcé du nœud '{node_name}'")
 
     def _sync_python_objects_from_gpu(self):
         """
@@ -5509,8 +5739,8 @@ class UnifiedBrain:
             physical_saliency = obj.energy / 100.0; total_saliency = (saliency + physical_saliency) / 2
             if total_saliency > CFG.THRESHOLD_LOOSE:
                 reaction_vec = F.normalize(obj_vec * mood_vec, p=2, dim=0, eps=CFG.EPSILON)
-                feel_word = self.associative_memory.articulate(reaction_vec)
-                layer_feel_word, feel_word = HybridMemoryCluster._parse_key(feel_word)
+                feel_word, layer_feel_word, feel_score = self.associative_memory.articulate(reaction_vec)
+                #layer_feel_word, feel_word = HybridMemoryCluster._parse_key(feel_word)
                 print(f"   > {agent_name} remarque '{obj.name}' (Saliency: {total_saliency:.2f}) -> Ressent: {feel_word}")
 
     def instantiate(self, name, concept, loc, layer_type=None):
@@ -5603,7 +5833,7 @@ class UnifiedBrain:
         # 2. Allocation des nouvelles structures (Compaction)
         new_capacity = max(CFG.INITIAL_MAX_NODES, int(new_count * 1.1)) # +10% de marge
         
-        new_memory = HybridMemoryCluster(self.dim, max_nodes=new_capacity,  ram_limit=self.ram_limit)
+        new_memory = HybridMemoryCluster(self.dim, max_nodes=new_capacity,  ram_limit=self.ram_limit, brain=self)
         new_energies = torch.zeros(new_capacity, dtype=torch.float32).to(CFG.DEVICE)
         
         new_registry = {}
@@ -5760,11 +5990,16 @@ class UnifiedBrain:
         if all_tensors:
             print(f" [LOAD] Réhydratation de {len(all_tensors)} vecteurs sémantiques...")
             for name, vec in all_tensors.items():
-                if not name.startswith("ROOT"): 
-                    #print(f'[record] index02 {name} ')
-                    self.encoder.semantic_map[name] = vec
-                    self.associative_memory.register_word(name, vec)
-                    #print(f'[rehyd] index: {name} , vector: {vec}')
+                #if not name.startswith("ROOT"): #### legacy pour filtrer et eviter le restore de root
+                #print(f'[record] index02 {name} ')
+                
+                #self.encoder.semantic_map[name] = vec
+                # --- FIX : On injecte le NOUVEAU vecteur directement ---
+                layer, real_name = HybridMemoryCluster._parse_key(name)
+                self.memory.update(real_name, vec, layer)
+                # -------------------------------------------------------
+                self.associative_memory.register_word(name, vec)
+                #print(f'[rehyd] index: {name} , vector: {vec}')
                     
         # 3. Chargement de la Structure (JSON + Tenseurs Monde)
         struct, w_states, saved_energies, meta = SafeFileManager.load_monolithic_v2(CFG.BASE_MEM_DIR)
@@ -5860,13 +6095,13 @@ class UnifiedBrain:
                 # --- FIX RESTAURATION MONOLITHIQUE ---
                 if d == "__NATURE__":
                     # On restaure le vecteur dans l'objet Node
-                    path_to_obj[p].nature_vec = v.to(device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
+                    path_to_obj[p].nature_vec = Quantizer.from_storage(v.to(device=CFG.DEVICE))
                     # Note: On ne force pas self.memory.update ici pour laisser 
                     # la priorité à LanceDB (chargé dans __init__).
                     # Ce fichier sert de filet de sécurité structurel.
                 # -------------------------------------
                 else:
-                    path_to_obj[p].set(d, v)
+                    path_to_obj[p].set(d, Quantizer.from_storage(v.to(device=CFG.DEVICE)))
 
         
         # ==============================================================================
@@ -5884,7 +6119,31 @@ class UnifiedBrain:
             # Slicing intelligent : on prend les N premières dims du vecteur sémantique
             # On s'assure d'être sur le bon device pour la copie
             semantics = self.memory.fast_index[:safe_n].to(CFG.DEVICE)
-            self.memory_positions[:safe_n] = semantics[:, :CFG.SPATIAL_DIM]
+            
+            
+            # --- FIX DIMENSIONNEL (Support Base 64 vs Espace 128) ---
+            # On adapte la projection sémantique -> physique peu importe les tailles
+            sem_dim = semantics.shape[1]
+            phys_dim = CFG.SPATIAL_DIM # 128
+
+            if sem_dim >= phys_dim:
+                # Cas A : Sémantique Riche (ex: 4096) -> On coupe (Crop)
+                self.memory_positions[:safe_n] = semantics[:, :phys_dim]
+                #self.memory_positions[:safe_n] = semantics[:, :CFG.SPATIAL_DIM]
+            else:
+                # Cas B : Sémantique Compacte (ex: 64) -> On Pad (Remplissage)
+                # 1. On injecte ce qu'on a (les 64 premières dims)
+                self.memory_positions[:safe_n, :sem_dim] = semantics
+                
+                # 2. On remplit le vide (64 à 128) avec des Zéros (Neutre)
+                # Cela place le concept sur un "plan" 64D au sein de l'espace 128D.
+                self.memory_positions[:safe_n, sem_dim:] = 0.0
+            # --------------------------------------------------------
+            
+            
+            
+            
+            #self.memory_positions[:safe_n] = semantics[:, :CFG.SPATIAL_DIM]
             # On initialise aussi le snapshot pour éviter de marquer tout "dirty" au premier save
             self.snapshot_positions[:safe_n] = self.memory_positions[:safe_n]
 
@@ -5944,7 +6203,10 @@ class UnifiedBrain:
                         for ids_list, pos_list, vel_list in zip(ids, positions, velocities):
                             # Vérification : Est-ce un noeud valide et chargé ?
                             # Et est-ce que la position existe en base ?
-                            if ids_list in semantic_map and pos_list is not None:
+                            #if ids_list in semantic_map and pos_list is not None:
+                            layer_output_name, output_name = HybridMemoryCluster._parse_key(ids_list)
+                            key = HybridMemoryCluster._make_key(output_name, layer_output_name)
+                            if pos_list is not None:
                                 idx = self.name_to_idx[key]
                                 # On écrase la projection sémantique par la vérité historique
                                 t_pos = torch.tensor(pos_list, device=CFG.DEVICE, dtype=torch.float32)
@@ -6022,7 +6284,26 @@ class UnifiedBrain:
                 
                 # On ne prend QUE les N premières dimensions (128) pour la position
                 # C'est l'opérateur [:, :128] qui fait la découpe.
-                self.memory_positions[:safe_count] = semantics[:, :CFG.SPATIAL_DIM]
+                # --- FIX DIMENSIONNEL (Support Base 64 vs Espace 128) ---
+                # On adapte la projection sémantique -> physique peu importe les tailles
+                sem_dim = semantics.shape[1]
+                phys_dim = CFG.SPATIAL_DIM # 128
+
+                if sem_dim >= phys_dim:
+                    # Cas A : Sémantique Riche (ex: 4096) -> On coupe (Crop)
+                    self.memory_positions[:safe_count] = semantics[:, :phys_dim]
+                    #self.memory_positions[:safe_count] = semantics[:, :CFG.SPATIAL_DIM]
+                    self.memory_positions[:safe_count] = semantics[:, :CFG.SPATIAL_DIM]
+                else:
+                    # Cas B : Sémantique Compacte (ex: 64) -> On Pad (Remplissage)
+                    # 1. On injecte ce qu'on a (les 64 premières dims)
+                    self.memory_positions[:safe_count, :sem_dim] = semantics
+                    
+                    # 2. On remplit le vide (64 à 128) avec des Zéros (Neutre)
+                    # Cela place le concept sur un "plan" 64D au sein de l'espace 128D.
+                    self.memory_positions[:safe_count, sem_dim:] = 0.0
+                # --------------------------------------------------------
+                #self.memory_positions[:safe_count] = semantics[:, :CFG.SPATIAL_DIM]
                 # ==================================================================
         # --------------------------------------
         
@@ -6170,16 +6451,16 @@ class UnifiedBrain:
                 print(f" [TIME] Archivage de l'événement: Sur {instance.name}")
                 self._archive_event(instance, dim_name, perceived_vec)
                     
-    def generate_response(self, input_vec):
+    def generate_response(self, input_vec, anti_parrot=False):
         concept_name, concept_layer, score = self.memory.find_closest(input_vec, threshold=0.5)
         if not concept_name: 
-            output_name = self.associative_memory.articulate(input_vec)
-            layer_output_name, output_name = HybridMemoryCluster._parse_key(output_name)
+            output_name, layer_output_name, score_output_name = self.associative_memory.articulate(input_vec, anti_parrot=anti_parrot)
+            #layer_output_name, output_name = HybridMemoryCluster._parse_key(output_name)
             return output_name
-        sentence = self.verbalize_thought(concept_name)
+        sentence = self.verbalize_thought(concept_name,anti_parrot=anti_parrot)
         return sentence if sentence else concept_name
 
-    def verbalize_thought(self, concept_name):
+    def verbalize_thought(self, concept_name, anti_parrot=False):
         # 1. On cherche d'abord le concept pur
         node = self.find_concept_exact(concept_name)
         
@@ -6197,8 +6478,8 @@ class UnifiedBrain:
         chosen_key = random.choice(valid_keys)
         vec_target = node.states[chosen_key]
         
-        target_name = self.associative_memory.articulate(vec_target, anti_parrot=False)
-        layer_target_name, target_name = HybridMemoryCluster._parse_key(target_name)
+        target_name, layer_target_name, score_name = self.associative_memory.articulate(vec_target, anti_parrot=anti_parrot)
+        #layer_target_name, target_name = HybridMemoryCluster._parse_key(target_name)
         if target_name == "???": return None
         
         # --- CORRECTIF V06 : Déballage des Molécules ---
@@ -6218,7 +6499,8 @@ class UnifiedBrain:
         relation_word = "est"
         if chosen_key == "loc": relation_word = "dans"
         # Si la clé est un mot connu (ex: "mange"), on l'utilise comme verbe
-        elif key_concept in self.encoder.semantic_map: relation_word = chosen_key
+        #elif key_concept in self.encoder.semantic_map: relation_word = chosen_key
+        elif key_concept in self.memory.name_to_idx: relation_word = chosen_key
         
         if relation_word.lower() == target_name.lower():
             relation_word = "est"
@@ -6253,8 +6535,8 @@ class UnifiedBrain:
             for child_name in node.children: queue.append((child_name, energy * decay))
             for relation, linked_vec in node.states.items():
                 if linked_vec.is_sparse: linked_vec = linked_vec.to_dense()
-                linked_name = self.associative_memory.articulate(linked_vec, anti_parrot=False)
-                layer_linked_name, linked_name = HybridMemoryCluster._parse_key(linked_name)
+                linked_name, layer_linked_name, score_linked_name = self.associative_memory.articulate(linked_vec, anti_parrot=False)
+                #layer_linked_name, linked_name = HybridMemoryCluster._parse_key(linked_name)
                 if linked_name != "???" and linked_name not in visited:
                     print(f"   -> Lien trouvé : {current_name} --[{relation}]--> {linked_name}")
                     queue.append((linked_name, energy * decay))
@@ -6391,41 +6673,14 @@ class UnifiedBrain:
             cpu_idx = moved_indices.cpu().numpy()
             
             current_time = time.time()
-            """
-            cpu_pos = self.memory_positions[uid].detach().cpu().numpy()
-            cpu_vel = self.memory_velocities[uid].detach().cpu().numpy()
             
-            self.fast_index[idx].detach().cpu().numpy()
-            #######################""
-            for key in self.dirty_set:
-            if key in self.name_to_idx:
-                idx = self.name_to_idx[key]
-                lay, nm = self._parse_key(key)
-                vec = self.fast_index[idx].detach().cpu().numpy()
-                data.append({"vector": vec, "name": nm, "layer": str(lay), "id": idx})
-                keys_done.append(key)
-            ##################################
-            for i, uid in enumerate(cpu_idx):
-            # On récupère le nom depuis le registre pour le debug (optionnel)
-            node = self.node_registry.get(int(uid))
-            if node:
-                updates.append({
-                    "id": int(uid),
-                    "name": node.name,           # Lisibilité
-                    "layer": str(node.layer_type), # Clé composite (avec name)
-                    "pos": cpu_pos[i].tolist(), # LanceDB veut des listes, pas des numpy arrays
-                    "vel": cpu_vel[i].tolist(),
-                    "last_updated": current_time
-                    # Note: LanceDB 'merge' met à jour les champs fournis et garde les autres
-                })
-            """
             
             for i, uid in enumerate(cpu_idx):
                 # On récupère le nom depuis le registre pour le debug (optionnel)
                 node = self.node_registry.get(int(uid))
                 if node:
                     updates.append({
-                        "id": HybridMemoryCluster._make_key(node.name, node.layer_type),
+                        "id": HybridMemoryCluster._make_key(node.name, node.layer_type, boolstring =True),
                         "name": node.name,           # Lisibilité
                         "layer": str(node.layer_type), # Clé composite (avec name)
                         "pos": self.memory_positions[uid].detach().cpu().numpy(), # LanceDB veut des listes, pas des numpy arrays
@@ -6492,7 +6747,17 @@ class UnifiedBrain:
                             mots = user_input.replace(".", "").split()
                             if mots:
                                 vec_pensee = torch.zeros(self.dim).to(CFG.DEVICE)
-                                for m in mots: vec_pensee += self.encoder.encode_word(m, layer_type)
+                                for m in mots:
+                                    # A. On récupère le Concept Pur (Direction)
+                                    vec_pur = self.encoder.encode_word(m, layer_type)
+                                    
+                                    # B. On récupère son importance actuelle (Masse)
+                                    poids = self.encoder.stats.get_inverse_freq_weight(m.lower())
+                                    
+                                    # C. ON MULTIPLIE MANUELLEMENT ICI (Composition)
+                                    # "Je veux beaucoup de 'Chat' et très peu de 'Le'"
+                                    vec_pensee += vec_pur * poids
+                                    #vec_pensee += self.encoder.encode_word(m, layer_type)
                                 vec_pensee = F.normalize(vec_pensee, p=2, dim=0, eps=CFG.EPSILON)
                                 reponse = self.generate_response(vec_pensee)
                                 print(f" > GENESIS: {reponse}")
@@ -6707,9 +6972,14 @@ class GenesisDiagnostic:
                 
             # Verdict
             nb_concepts = sum(1 for g in ghosts if not g.startswith(("HYP_", "MOL_", "EVT_")))
+            intROOT_count = 0
+            
             print(f"\n [VERDICT] Parmi les fantômes :")
-            print(f"   - Hypothèses/Molécules/Events (Transient) : {len(ghosts) - nb_concepts}")
-            print(f"   - Concepts Purs (Potentiellement critique) : {nb_concepts}")
+            if "ROOT" in sorted_ghosts:
+                print(f"   - ROOT DELETION is normal")
+                intROOT_count = 1
+            print(f"   - Hypothèses/Molécules/Events (Transient) : {len(ghosts) - (nb_concepts)}")
+            print(f"   - Concepts Purs (Potentiellement critique) : {nb_concepts - intROOT_count}")
             
             if nb_concepts == 0:
                 print(" [SUCCESS] Perte bénigne. Seuls des éléments transitoires ont été nettoyés.")
@@ -6774,8 +7044,8 @@ class GenesisDiagnostic:
         #strKey = obj_target._make_key()
         vec = self.brain.encoder.get_semantic_vector(target) ##CCOERRE
         self.brain.associative_memory.register_word(target, vec)
-        word = self.brain.associative_memory.articulate(vec, anti_parrot=False)
-        layer_word, word = HybridMemoryCluster._parse_key(word)
+        word, layer_word, score_word = self.brain.associative_memory.articulate(vec, anti_parrot=False)
+        #layer_word, word = HybridMemoryCluster._parse_key(word)
         print(f" > Vecteur('{target}') -> Broca dit: '{word}'")
         if word == target: print(" [SUCCESS] Broca OK.")
         else: print(f" [FAIL] Broca HS.")
@@ -6887,10 +7157,16 @@ class GenesisDiagnostic:
         self.brain.ensure_concept("Chocolat")
         self.brain.perceive("Il y a un Chocolat dans Salon .", mode="REALITY")
         
-        vec_choco = self.brain.encoder.encode_word("Chocolat"); vec_triste = self.brain.encoder.encode_word("Tristesse"); vec_joie = self.brain.encoder.encode_word("Joie")
-        vec_reconfort = F.normalize(vec_choco * vec_triste, p=2, dim=0, eps=CFG.EPSILON); self.brain.ensure_concept("Reconfort").nature_vec = vec_reconfort
+        vec_choco = self.brain.encoder.encode_word("Chocolat")
+        vec_triste = self.brain.encoder.encode_word("Tristesse")
+        vec_joie = self.brain.encoder.encode_word("Joie")
+        vec_reconfort = F.normalize(vec_choco * vec_triste, p=2, dim=0, eps=CFG.EPSILON)
+        vec_degout = F.normalize(vec_choco * vec_joie, p=2, dim=0, eps=CFG.EPSILON)
+        #vec_reconfort = F.normalize(Quantizer.from_storage(vec_choco) * Quantizer.from_storage(vec_triste), p=2, dim=0, eps=CFG.EPSILON)
+        #vec_degout = F.normalize(Quantizer.from_storage(vec_choco) * Quantizer.from_storage(vec_joie), p=2, dim=0, eps=CFG.EPSILON)
+        self.brain.ensure_concept("Reconfort").nature_vec = vec_reconfort
         self.brain.memory.update("Reconfort", vec_reconfort); self.brain.associative_memory.register_word("Reconfort", vec_reconfort)
-        vec_degout = F.normalize(vec_choco * vec_joie, p=2, dim=0, eps=CFG.EPSILON); self.brain.ensure_concept("Degout").nature_vec = vec_degout
+        self.brain.ensure_concept("Degout").nature_vec = vec_degout
         self.brain.memory.update("Degout", vec_degout); self.brain.associative_memory.register_word("Degout", vec_degout)
         
         print("\n > Simulation ALICE (Triste)...")
@@ -6964,7 +7240,7 @@ class GenesisDiagnostic:
         print(" > Forçage d'une pensée simple 'Le Feu est Chaud' pour tester la Bouche...")
         c_feu = self.brain.ensure_concept("Feu")
         c_feu.set("chaud", self.brain.encoder.encode_word("Chaud"))
-        sentence = self.brain.verbalize_thought("Feu")
+        sentence = self.brain.verbalize_thought("Feu", anti_parrot=True)
         print(f" > Bouche génère : '{sentence}'")
         if sentence and "est" in sentence:
             print(" [SUCCESS] La Bouche sait parler (SVO).")
@@ -7673,13 +7949,15 @@ class GenesisDiagnostic:
             
     def test_bridge_architecture(self):
         print("\n--- 40. TEST ARCHITECTURE BRIDGE (MVP97) ---")
-        
+        layer_type=CFG.LAYER_CONCEPT
+        mode="REALITY"
+        trust=1.0
         # Test 1 : Bridge Léger (Production)
         print(" > Test du Bridge Léger (Threading)...")
         if self.brain.stream.bridge:
             # On injecte manuellement
             test_phrase = ["Le", "Turbo", "est", "rapide"]
-            self.brain.stream.bridge.in_q.put(test_phrase)
+            self.brain.stream.bridge.in_q.put({"PKGE" : test_phrase, "layer": layer_type,"mode": mode,"trust": trust})
             time.sleep(0.1) # Laisser le temps au thread
             
             if not self.brain.stream.bridge.out_q.empty():
@@ -7695,6 +7973,10 @@ class GenesisDiagnostic:
         print("\n--- 41. TEST HYBRIDE (HEAVY -> LIGHT CHAIN) ---")
         print(" > Simulation d'un pipeline distribué...")
         
+        
+        layer_type=CFG.LAYER_CONCEPT
+        mode="REALITY"
+        trust=1.0
         # Files d'attente pour le processus lourd (Picklable)
         mp_ctx = multiprocessing.get_context("spawn") # Sécurité Windows
         heavy_in = mp_ctx.Queue()
@@ -7724,7 +8006,7 @@ class GenesisDiagnostic:
                 # On utilise la nouvelle méthode process_data qui attend une liste de lignes
                 # Donc on encapsule notre phrase dans une liste de lignes (ici une seule ligne)
                 fake_line = " ".join(fake_sentence) + " ."
-                self.brain.stream.bridge.in_q.put([fake_line])
+                self.brain.stream.bridge.in_q.put({"PKGE" : [fake_line], "layer": layer_type,"mode": mode,"trust": trust})
                 
                 # Vérif (On laisse un peu de temps au thread léger)
                 time.sleep(0.5)
@@ -7916,7 +8198,7 @@ class GenesisDiagnostic:
     def test_lazy_memory_performance(self):
         print("\n--- 45. TEST 'INFINITE MEMORY' (RAM + DISK SWAP) ---")
         # Création d'un mini-cluster saturé (50 places)
-        mem = HybridMemoryCluster(self.brain.dim, max_nodes=50, ram_limit=50)
+        mem = HybridMemoryCluster(self.brain.dim, max_nodes=50, ram_limit=50, brain=self.brain)
         mem.table_name = "test_swap"
         if mem.db and "test_swap" in mem.db.table_names(): mem.db.drop_table("test_swap")
         
@@ -8092,7 +8374,7 @@ class GenesisDiagnostic:
         
         tbl = db.open_table(tbl_name)
         # Requête pour récupérer notre noeud test
-        str_key = HybridMemoryCluster._make_key(node.name, node.layer_type)
+        str_key = HybridMemoryCluster._make_key(node.name, node.layer_type, boolstring = True)
         res = tbl.search().where(f"id = '{str_key}'").limit(1).to_pandas()
         
         if res.empty:
@@ -8136,11 +8418,17 @@ if __name__ == "__main__":
     #RUN_MODE = "IMPORT_MODEL" 
     #RUN_MODE = "INFERENCE" 
     
+    
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+        print(" [SYSTEME] Multiprocessing : Mode 'spawn' forcé (Isolation mémoire active).")
+    except RuntimeError:
+        pass
     CFG = GenesisConfig(dim=Nb_DIM, PrecisionType = strPRECISION_MODE, ForceCPU=boolForceCPU, ENABLE_MULTITHREADING=boolENABLE_MULTITHREADING,FORCE_LIGHT_MODE=boolFORCE_LIGHT_MODE, CUDA_GRAPH_UNACTIVE =boolcuda_graph_desactivation)
     # --- INSTANCE GLOBALE LOGGER ---
     LOGGER = GenesisAsyncLogger()
     LOGGER.start()
-    
+    print_hardware_information()
     try:
         if RUN_MODE == "DIAGNOSTIC":
             CFG.BASE_MEM_DIR = CFG.BASE_MEM_DIR + "_DIAG"
