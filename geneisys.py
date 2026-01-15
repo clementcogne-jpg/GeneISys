@@ -98,7 +98,7 @@ standard Computer Science / Machine Learning equivalents.
 ================================================================================
 """
 
-strVersion = "0.0.96_16_15_06nQ_40_STABLE_alpha"
+strVersion = "0.0.96_16_15_06nQ_41_STABLE_alpha"
 
 import sys
 import platform
@@ -2205,7 +2205,7 @@ class AssociativeMemory:
                  best_word = matches[1][0]
                  best_layer= matches[1][1]
                  score = matches[1][2]
-            print(f" [ARTICULATE RETURN] word: {best_word} layer: {best_layer} score : {score}")
+            print(f"          [ARTICULATE RETURN] word: {best_word} layer: {best_layer} score : {score}")
             return best_word, best_layer, score
 
 
@@ -2955,7 +2955,8 @@ class HybridMemoryCluster:
                                     c_layer, _ = self._parse_key(full_key)
                                     if layer_set and str(c_layer) not in layer_set:
                                         continue
-                                        
+                                    
+                                    print(f'           [FAISS TopK IN]{full_key} {score}')
                                     candidates[full_key] = score
                 except Exception as e:
                     print(f" [WARN] Erreur FAISS Search: {e}")
@@ -3024,9 +3025,9 @@ class HybridMemoryCluster:
                         # on NE l'écrase PAS, car la version RAM est plus récente.
                         if full_key not in candidates:
                             candidates[full_key] = score
-                        print(f' [LANCEDB TopK IN]{full_key} {score}')
+                        print(f'           [LANCEDB TopK IN]{full_key} {score}')
                     else:
-                        print(f' [LANCEDB TopK OUT]{full_key} {score}')
+                        print(f'           [LANCEDB TopK OUT]{full_key} {score}')
             except Exception as e:
                 print(f" [WARN] Erreur lanceDB Search: {e}")
 
@@ -5271,27 +5272,38 @@ class UnifiedBrain:
         
         return uid
 
-    def register_node_lookup(self, node):
+    def register_node_lookup(self, node, fast_lookup_in=None, fuzzy_lookup_in= None):
         """
         Enregistre le nœud dans les index Exact et Flou.
         Gère les collisions de casse (Chat/chat) via une liste.
         """
+        if fast_lookup_in is None:
+            fast_lookup = self.fast_lookup
+        else:
+            fast_lookup = fast_lookup_in
+            
+        if fuzzy_lookup_in is None:
+            fuzzy_lookup = self.fuzzy_lookup
+        else:
+            fuzzy_lookup = fuzzy_lookup_in
+        
+        
         if node.layer_type is not None:
             # 1. Index Principal (Exact) - Toujours unique
             name_raw = node.name.strip()
             key_exact = (name_raw, node.layer_type)
-            self.fast_lookup[key_exact] = node.uid
+            fast_lookup[key_exact] = node.uid
             
             # 2. Index Secondaire (Flou) - Gestion des collisions
             name_norm = self._normalize_key(name_raw)
             key_fuzzy = (name_norm, node.layer_type)
             
-            if key_fuzzy not in self.fuzzy_lookup:
-                self.fuzzy_lookup[key_fuzzy] = []
+            if key_fuzzy not in fuzzy_lookup:
+                fuzzy_lookup[key_fuzzy] = []
             
             # On ajoute l'UID s'il n'y est pas déjà
-            if node.uid not in self.fuzzy_lookup[key_fuzzy]:
-                self.fuzzy_lookup[key_fuzzy].append(node.uid)
+            if node.uid not in fuzzy_lookup[key_fuzzy]:
+                fuzzy_lookup[key_fuzzy].append(node.uid)
 
 
     def force_node_unload(self, name, layer_type=0):
@@ -5838,6 +5850,7 @@ class UnifiedBrain:
         
         new_registry = {}
         new_fast_lookup = {}
+        new_fuzzy_lookup = {}
         
         # Buffers pour la mise à jour vectorielle en masse
         vectors_to_keep = []
@@ -5894,9 +5907,8 @@ class UnifiedBrain:
             # 1. Registres
             new_registry[new_uid] = node
             # Update lookup avec le nouveau UID
-            if node.layer_type is not None:
-                key = (node.name, node.layer_type)
-                new_fast_lookup[key] = new_uid
+            self.register_node_lookup(node, fast_lookup_in=new_fast_lookup, fuzzy_lookup_in= new_fuzzy_lookup)
+            
             
             # 2. Energie
             new_energies[new_uid] = current_energy
@@ -5917,6 +5929,7 @@ class UnifiedBrain:
         # 5. Bascule (Swap)
         self.node_registry = new_registry
         self.fast_lookup = new_fast_lookup
+        self.fuzzy_lookup = new_fuzzy_lookup
         self.global_energies = new_energies
         self.next_node_id = new_count
         self.max_nodes = new_capacity
